@@ -1,0 +1,5 @@
+LOAD DATABASE
+    FROM sqlite:///Users/alessandro/Development/research/spotify-chart-paper/kworb_italy.db
+    INTO postgresql://user:pass@10.0.0.25:5432/chartsdataset
+
+WITH include drop, create tables, create indexes, reset sequences;

@@ -115,4 +115,10 @@ LEFT JOIN track_reccobeats rb ON rb.track_id = t.track_id
 LEFT JOIN track_analysis a ON a.track_id = t.track_id
 LEFT JOIN track_high_level_binary b ON b.track_id = t.track_id
 LEFT JOIN track_high_level_categorical c ON c.track_id = t.track_id
-GROUP BY t.track_id;
+GROUP BY
+    t.track_id, t.title, t.artist,
+    rb.acousticness, rb.danceability, rb.energy, rb.instrumentalness,
+    rb.liveness, rb.loudness, rb.speechiness, rb.tempo, rb.valence,
+    rb.isrc, rb.duration_ms,
+    a.bpm, a.key_key, a.key_scale, a.loudness_ebu128,
+    a.danceability_raw, a.duration_sec;

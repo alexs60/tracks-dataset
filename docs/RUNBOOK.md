@@ -346,9 +346,15 @@ Example output:
 Tracks total:                  9,150
 Stage 1 (Spotify preview):     250 ok | 3 no_preview | 1 failed | 8,896 pending
 Stage 2 (Reccobeats):          242 ok | 8 not_found | 0 no_features | 0 failed | 8,900 pending
+Stage 2.1 (External fallback): 6 filled (kaggle_maharshipandya=6)
 Stage 3 (Essentia):            230 ok | 2 failed | 10 pending
-Fully enriched:                221 (2.4%)
+Audio features available:      248 (2.7%)
+Fully enriched:                225 (2.5%)
 ```
+
+`Audio features available` counts tracks with audio scalars from any source
+(Reccobeats `ok` or external fallback row present). `Fully enriched` is that
+set intersected with Essentia `ok`.
 
 ### Log files
 
@@ -369,6 +375,79 @@ grep '"event": "failed"' logs/stage3.log | tail -20
 
 ---
 
+## Part 4.1 — Stage 2.1: external CSV fallback (optional)
+
+Stage 2.1 fills audio scalars for tracks where Reccobeats came back `not_found`,
+`no_features`, or `failed` (or didn't return a row at all). It is **operator-run**
+— not part of `run_pipeline.py` — and only useful when you have an external
+Spotify-features CSV (e.g. a Kaggle dump) that overlaps your catalogue.
+
+The flow is two steps: load the CSV into the staging table, then fill from it.
+Both steps are idempotent.
+
+### Step 1 — Load a CSV into the staging table
+
+```bash
+# Default column names (Maharshipandya / Kaggle layout)
+python scripts/load_external_features.py \
+    --csv ~/kaggle/maharshipandya/dataset.csv \
+    --source kaggle_maharshipandya
+
+# CSV with non-default column names + ISRC available
+python scripts/load_external_features.py \
+    --csv ~/dumps/other.csv \
+    --source kaggle_other \
+    --spotify-id-col spotify_track_id \
+    --isrc-col isrc
+
+# Reload after changing the CSV / column mapping
+python scripts/load_external_features.py \
+    --csv ~/dumps/other.csv \
+    --source kaggle_other \
+    --replace
+```
+
+Rows land in `external_audio_features_raw` keyed by `(source, spotify_id)`.
+Re-running with the same `--source` upserts; pass `--replace` to clear that
+source first.
+
+### Step 2 — Fill `track_audio_features_external` from the staging table
+
+```bash
+# Match by Spotify track_id only (default)
+python scripts/fill_external_features.py --source kaggle_maharshipandya
+
+# Also try ISRC fallback for tracks that didn't match by Spotify ID,
+# but where Reccobeats returned an ISRC for them.
+python scripts/fill_external_features.py --source kaggle_other --by-isrc
+
+# Sizing run — count matches without writing anything
+python scripts/fill_external_features.py --source kaggle_x --dry-run
+```
+
+The fill is gated on `track_reccobeats.status` — it only writes rows for tracks
+where Reccobeats did **not** return `ok`, so Reccobeats data is never overwritten.
+Re-runnable: `ON CONFLICT (track_id) DO UPDATE` keeps the latest values.
+
+### Verifying coverage
+
+```bash
+python scripts/status.py
+```
+
+Look for the `Stage 2.1 (External fallback)` line (counts and per-source
+breakdown) and `Audio features available` (the union of Reccobeats `ok` and
+external fallback). Exports include the merged values automatically (see Part
+6.2 below); the `af_source` column records which source populated each row.
+
+### Resetting
+
+See Part 5. `--stage 2.1 --all` clears `track_audio_features_external` but
+leaves the staging table intact, so a re-fill doesn't require re-loading the
+CSV.
+
+---
+
 ## Part 5 — Administrative operations
 
 ### Reset a single track
@@ -382,6 +461,9 @@ python scripts/reset_stage.py --stage 1 --track-id SPOTIFY_TRACK_ID
 # Reset Stage 2 for one track
 python scripts/reset_stage.py --stage 2 --track-id SPOTIFY_TRACK_ID
 
+# Reset Stage 2.1 (external fallback) for one track
+python scripts/reset_stage.py --stage 2.1 --track-id SPOTIFY_TRACK_ID
+
 # Reset Stage 3 for one track
 python scripts/reset_stage.py --stage 3 --track-id SPOTIFY_TRACK_ID
 ```
@@ -392,6 +474,11 @@ Wipes all results for the given stage (e.g. after a schema change or parser fix)
 
 ```bash
 python scripts/reset_stage.py --stage 3 --all
+
+# Stage 2.1: clears track_audio_features_external; leaves the
+# external_audio_features_raw staging table intact, so re-running
+# fill_external_features.py is enough — no need to reload the CSV.
+python scripts/reset_stage.py --stage 2.1 --all
 ```
 
 ### Stage status meanings
@@ -405,6 +492,7 @@ python scripts/reset_stage.py --stage 3 --all
 | 2 | `not_found` | Track not in Reccobeats catalogue |
 | 2 | `no_features` | Track in catalogue but no audio features |
 | 2 | `failed` | API error |
+| 2.1 | (row present) | Audio features filled from external CSV (only for tracks where Stage 2 didn't return `ok`). The `source` column records which CSV; `matched_by` records `spotify_id` or `isrc`. |
 | 3 | `ok` | Essentia SVM descriptors stored |
 | 3 | `failed` | Download or API error |
 
@@ -509,6 +597,11 @@ docker compose logs -f pipeline
 
 # 7. Periodically check coverage in another terminal
 python scripts/status.py
+
+# 8. (optional) Once Stage 2 has settled, fill the gaps from an external CSV.
+#    See Part 4.1 for details.
+python scripts/load_external_features.py --csv ~/kaggle/dataset.csv --source kaggle_maharshipandya
+python scripts/fill_external_features.py --source kaggle_maharshipandya
 ```
 
 ### With SQLite (development / local)
@@ -528,4 +621,8 @@ python workers/run_pipeline.py --batch-size 50 --interval 30
 
 # 5. Monitor
 python scripts/status.py
+
+# 6. (optional) Fill remaining gaps from an external CSV. See Part 4.1.
+python scripts/load_external_features.py --csv ~/kaggle/dataset.csv --source kaggle_maharshipandya
+python scripts/fill_external_features.py --source kaggle_maharshipandya
 ```

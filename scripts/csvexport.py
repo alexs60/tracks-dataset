@@ -35,8 +35,19 @@ Examples:
 Notes on the row gate:
   By default a track is exported if track_analysis.status='ok'. This is the
   "taxonomy is filled" condition. Use --require-reccobeats to additionally
-  require track_reccobeats.status='ok', or --no-essentia-gate to drop the gate
-  entirely (export every chart row, regardless of enrichment).
+  require track_reccobeats.status='ok', --require-audio-features to require
+  audio scalars from any source (Reccobeats OR the external CSV fallback),
+  or --no-essentia-gate to drop the gate entirely (export every chart row,
+  regardless of enrichment).
+
+Audio-feature columns:
+  The nine audio scalars (af_acousticness, af_danceability, ...) come from
+  v_track_audio_features_merged: Reccobeats values first, falling back to
+  track_audio_features_external when Reccobeats failed for that track. The
+  af_source column records which source actually populated the row
+  ('reccobeats', the external source string, or NULL if neither has data).
+  duration_ms remains Reccobeats-only since the external sources don't
+  carry it.
 """
 
 from __future__ import annotations
@@ -74,17 +85,26 @@ TRACK_COLS = [
     ("t", "peak_it",       "peak_it"),
 ]
 
+# Reccobeats-only metadata. duration_ms isn't an audio scalar — only Reccobeats
+# carries it, so it stays sourced from track_reccobeats directly.
 RECCOBEATS_COLS = [
     ("rb", "duration_ms",         "duration_ms"),
-    ("rb", "acousticness",        "rb_acousticness"),
-    ("rb", "danceability",        "rb_danceability"),
-    ("rb", "energy",              "rb_energy"),
-    ("rb", "instrumentalness",    "rb_instrumentalness"),
-    ("rb", "liveness",            "rb_liveness"),
-    ("rb", "loudness",            "rb_loudness"),
-    ("rb", "speechiness",         "rb_speechiness"),
-    ("rb", "tempo",               "rb_tempo"),
-    ("rb", "valence",             "rb_valence"),
+]
+
+# Audio-feature scalars come from the merged view, which prefers Reccobeats
+# values and falls back to track_audio_features_external. The af_source column
+# records which one populated each row.
+AUDIO_FEATURE_COLS = [
+    ("vam", "acousticness",          "af_acousticness"),
+    ("vam", "danceability",          "af_danceability"),
+    ("vam", "energy",                "af_energy"),
+    ("vam", "instrumentalness",      "af_instrumentalness"),
+    ("vam", "liveness",              "af_liveness"),
+    ("vam", "loudness",              "af_loudness"),
+    ("vam", "speechiness",           "af_speechiness"),
+    ("vam", "tempo",                 "af_tempo"),
+    ("vam", "valence",               "af_valence"),
+    ("vam", "audio_features_source", "af_source"),
 ]
 
 ANALYSIS_COLS = [
@@ -125,13 +145,15 @@ def build_select_sql(args: argparse.Namespace) -> tuple[str, list[str]]:
     Returns (sql, header_columns).
 
     Joins:
-        chart_entries -> tracks -> track_reccobeats -> track_analysis
+        chart_entries -> tracks -> track_reccobeats (duration_ms only)
+                                -> v_track_audio_features_merged (audio scalars)
+                                -> track_analysis
         + pivoted high_level_binary (P(positive)) and categorical (winning class).
     """
     select_parts: list[str] = []
     header: list[str] = []
 
-    for tbl, col, alias in CHART_COLS + TRACK_COLS + RECCOBEATS_COLS + ANALYSIS_COLS:
+    for tbl, col, alias in CHART_COLS + TRACK_COLS + RECCOBEATS_COLS + AUDIO_FEATURE_COLS + ANALYSIS_COLS:
         select_parts.append(f"{tbl}.{col} AS {alias}")
         header.append(alias)
 
@@ -162,6 +184,8 @@ def build_select_sql(args: argparse.Namespace) -> tuple[str, list[str]]:
         where.append("a.status = 'ok'")
     if args.require_reccobeats:
         where.append("rb.status = 'ok'")
+    if args.require_audio_features:
+        where.append("vam.audio_features_source IS NOT NULL")
     if args.since:
         where.append("ce.week_date >= ?")
     if args.min_streams is not None:
@@ -173,18 +197,19 @@ def build_select_sql(args: argparse.Namespace) -> tuple[str, list[str]]:
     # on both backends.
     group_by_parts = [
         f"{tbl}.{col}"
-        for tbl, col, _ in CHART_COLS + TRACK_COLS + RECCOBEATS_COLS + ANALYSIS_COLS
+        for tbl, col, _ in CHART_COLS + TRACK_COLS + RECCOBEATS_COLS + AUDIO_FEATURE_COLS + ANALYSIS_COLS
     ]
     group_by_sql = ", ".join(group_by_parts)
 
     sql = f"""
         SELECT {select_sql}
         FROM chart_entries ce
-        JOIN tracks t                              ON t.track_id  = ce.track_id
-        LEFT JOIN track_reccobeats rb              ON rb.track_id = ce.track_id
-        LEFT JOIN track_analysis a                 ON a.track_id  = ce.track_id
-        LEFT JOIN track_high_level_binary hb       ON hb.track_id = ce.track_id
-        LEFT JOIN track_high_level_categorical hc  ON hc.track_id = ce.track_id
+        JOIN tracks t                                 ON t.track_id   = ce.track_id
+        LEFT JOIN track_reccobeats rb                 ON rb.track_id  = ce.track_id
+        LEFT JOIN v_track_audio_features_merged vam   ON vam.track_id = ce.track_id
+        LEFT JOIN track_analysis a                    ON a.track_id   = ce.track_id
+        LEFT JOIN track_high_level_binary hb          ON hb.track_id  = ce.track_id
+        LEFT JOIN track_high_level_categorical hc     ON hc.track_id  = ce.track_id
         {where_sql}
         GROUP BY {group_by_sql}
         ORDER BY ce.week_date DESC, ce.position ASC
@@ -334,7 +359,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--no-essentia-gate", action="store_true",
                    help="Don't require Essentia analysis; export every chart row.")
     p.add_argument("--require-reccobeats", action="store_true",
-                   help="Also require track_reccobeats.status='ok'.")
+                   help="Also require track_reccobeats.status='ok' (Reccobeats specifically).")
+    p.add_argument("--require-audio-features", action="store_true",
+                   help="Also require audio scalars from any source "
+                        "(Reccobeats OR the external CSV fallback).")
 
     p.add_argument("--since", type=str, default=None,
                    help="Filter chart_entries.week_date >= ISO date (YYYY-MM-DD).")
@@ -361,6 +389,8 @@ def main() -> None:
     gate = "none" if args.no_essentia_gate else "essentia ok"
     if args.require_reccobeats:
         gate += " + reccobeats ok"
+    if args.require_audio_features:
+        gate += " + audio features (any source)"
     shape = "latest per (track,country)" if args.latest_only else "one row per chart entry"
 
     if conn.backend == "postgres":

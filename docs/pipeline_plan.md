@@ -6,6 +6,17 @@
 **Existing storage:** SQLite (single file, schema below)
 **Status:** Spec — ready for analysis pass, then implementation
 
+> **Addendum (added later):** an additional **Stage 2.1** was introduced after the
+> initial implementation to cover tracks where Reccobeats does not have audio
+> features. It is operator-run, not part of the loop pipeline: load a Spotify-
+> features CSV (e.g. a Kaggle dump) into a staging table, then fill
+> `track_audio_features_external` for tracks where Reccobeats came back
+> non-`ok`. Schema lives in `migrations/002_external_audio_features.{sql,pg.sql}`;
+> tooling is `scripts/load_external_features.py` + `scripts/fill_external_features.py`;
+> the merged values are exposed via `v_track_audio_features_merged`. See the
+> README and `docs/RUNBOOK.md` (Part 4.1) for usage. The §3–§9 schema and stage
+> design below are otherwise unchanged.
+
 ---
 
 ## 1. Goal

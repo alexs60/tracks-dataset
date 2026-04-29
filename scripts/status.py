@@ -32,6 +32,12 @@ def main() -> None:
         stage2_failed = scalar(conn, "SELECT COUNT(*) FROM track_reccobeats WHERE status = 'failed'")
         stage2_pending = max(total - (stage2_ok + stage2_not_found + stage2_no_features + stage2_failed), 0)
 
+        stage2_1_total = scalar(conn, "SELECT COUNT(*) FROM track_audio_features_external")
+        source_rows = conn.execute(
+            "SELECT source, COUNT(*) FROM track_audio_features_external GROUP BY source ORDER BY source"
+        ).fetchall()
+        stage2_1_sources = [(row[0], int(row[1])) for row in source_rows]
+
         stage3_ok = scalar(conn, "SELECT COUNT(*) FROM track_analysis WHERE status = 'ok'")
         stage3_failed = scalar(conn, "SELECT COUNT(*) FROM track_analysis WHERE status = 'failed'")
         stage3_pending = scalar(
@@ -44,18 +50,47 @@ def main() -> None:
             """,
         )
 
+        # "Audio features available" = Reccobeats ok OR external fallback row present.
+        # By design fill_external_features.py only fills non-ok Reccobeats tracks,
+        # but the EXISTS form is correct even if that ever overlaps.
+        audio_features_total = scalar(
+            conn,
+            """
+            SELECT COUNT(*)
+            FROM tracks t
+            WHERE EXISTS (
+                SELECT 1 FROM track_reccobeats rb
+                WHERE rb.track_id = t.track_id AND rb.status = 'ok'
+            )
+            OR EXISTS (
+                SELECT 1 FROM track_audio_features_external ext
+                WHERE ext.track_id = t.track_id
+            )
+            """,
+        )
+
         fully_enriched = scalar(
             conn,
             """
             SELECT COUNT(*)
             FROM tracks t
-            JOIN track_reccobeats rb ON rb.track_id = t.track_id AND rb.status = 'ok'
             JOIN track_analysis a ON a.track_id = t.track_id AND a.status = 'ok'
             WHERE t.preview_status = 'ok'
+              AND (
+                EXISTS (
+                    SELECT 1 FROM track_reccobeats rb
+                    WHERE rb.track_id = t.track_id AND rb.status = 'ok'
+                )
+                OR EXISTS (
+                    SELECT 1 FROM track_audio_features_external ext
+                    WHERE ext.track_id = t.track_id
+                )
+              )
             """,
         )
 
     pct = (fully_enriched / total * 100.0) if total else 0.0
+    af_pct = (audio_features_total / total * 100.0) if total else 0.0
     print(f"Tracks total:                  {total:,}")
     print(
         "Stage 1 (Spotify preview):     "
@@ -68,10 +103,16 @@ def main() -> None:
         f"{stage2_no_features:,} no_features | {stage2_failed:,} failed | "
         f"{stage2_pending:,} pending"
     )
+    sources_suffix = (
+        f" ({', '.join(f'{src}={n:,}' for src, n in stage2_1_sources)})"
+        if stage2_1_sources else ""
+    )
+    print(f"Stage 2.1 (External fallback): {stage2_1_total:,} filled{sources_suffix}")
     print(
         "Stage 3 (Essentia):            "
         f"{stage3_ok:,} ok | {stage3_failed:,} failed | {stage3_pending:,} pending"
     )
+    print(f"Audio features available:      {audio_features_total:,} ({af_pct:.1f}%)")
     print(f"Fully enriched:                {fully_enriched:,} ({pct:.1f}%)")
 
 

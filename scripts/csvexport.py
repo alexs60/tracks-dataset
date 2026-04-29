@@ -63,10 +63,6 @@ TRACK_COLS = [
 ]
 
 RECCOBEATS_COLS = [
-    ("rb", "reccobeats_id",       "rb_id"),
-    ("rb", "isrc",                "isrc"),
-    ("rb", "ean",                 "ean"),
-    ("rb", "upc",                 "upc"),
     ("rb", "duration_ms",         "duration_ms"),
     ("rb", "acousticness",        "rb_acousticness"),
     ("rb", "danceability",        "rb_danceability"),
@@ -77,7 +73,6 @@ RECCOBEATS_COLS = [
     ("rb", "speechiness",         "rb_speechiness"),
     ("rb", "tempo",               "rb_tempo"),
     ("rb", "valence",             "rb_valence"),
-    ("rb", "status",              "rb_status"),
 ]
 
 ANALYSIS_COLS = [
@@ -106,8 +101,7 @@ HLB_CLASSIFIERS = [
     "mood_sad", "mood_party", "mood_happy", "mood_aggressive",
 ]
 HLC_CLASSIFIERS = [
-    "moods_mirex", "genre_electronic", "genre_tzanetakis",
-    "genre_dortmund", "genre_rosamerica", "rhythm_ismir04",
+    "moods_mirex", "genre_rosamerica",
 ]
 
 

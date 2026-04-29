@@ -36,7 +36,7 @@ def claim_batch(conn, batch_size: int) -> list[str]:
         SELECT t.track_id
         FROM tracks t
         LEFT JOIN track_reccobeats rb ON rb.track_id = t.track_id
-        WHERE rb.track_id IS NULL OR rb.status != 'ok'
+        WHERE rb.track_id IS NULL
         ORDER BY t.track_id
         LIMIT ?
         """,
@@ -148,7 +148,7 @@ def process_once(batch_size: int, logger) -> int:
                             "fetched_at": fetched_at,
                             "status": "not_found",
                         })
-                    log_event(logger, ts=utc_now_iso(), stage=2, track_id=track_id, event="ok", duration_ms=round((time.monotonic() - started) * 1000), error=None)
+                    log_event(logger, ts=utc_now_iso(), stage=2, track_id=track_id, event="not_found", duration_ms=round((time.monotonic() - started) * 1000), error=None)
                     continue
 
                 features: dict[str, object]

@@ -5,7 +5,6 @@ CREATE TABLE IF NOT EXISTS track_reccobeats (
     ean                 TEXT,
     upc                 TEXT,
     duration_ms         INTEGER,
-    available_countries TEXT,
     acousticness        REAL,
     danceability        REAL,
     energy              REAL,

@@ -15,7 +15,6 @@ class ReccobeatsTrack:
     ean: str | None
     upc: str | None
     duration_ms: int | None
-    available_countries: str | None
 
 
 def get_base_url() -> str:
@@ -71,11 +70,6 @@ def fetch_tracks(client: httpx.Client, spotify_ids: list[str]) -> dict[str, Recc
         spotify_id = _extract_spotify_id(item)
         if not spotify_id:
             continue
-        available = item.get("availableCountries")
-        if isinstance(available, list):
-            available_countries = ",".join(available)
-        else:
-            available_countries = available
         results[spotify_id] = ReccobeatsTrack(
             spotify_track_id=spotify_id,
             reccobeats_id=item.get("id"),
@@ -83,7 +77,6 @@ def fetch_tracks(client: httpx.Client, spotify_ids: list[str]) -> dict[str, Recc
             ean=item.get("ean"),
             upc=item.get("upc"),
             duration_ms=item.get("durationMs"),
-            available_countries=available_countries,
         )
     return results
 

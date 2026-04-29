@@ -14,7 +14,6 @@ CREATE TABLE IF NOT EXISTS track_reccobeats (
     ean                 TEXT,
     upc                 TEXT,
     duration_ms         INTEGER,
-    available_countries TEXT,
     acousticness        REAL,
     danceability        REAL,
     energy              REAL,
@@ -122,3 +121,13 @@ GROUP BY
     rb.isrc, rb.duration_ms,
     a.bpm, a.key_key, a.key_scale, a.loudness_ebu128,
     a.danceability_raw, a.duration_sec;
+
+-- Drop bloat column (idempotent via DO block)
+DO $$ BEGIN
+    IF EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_name = 'track_reccobeats' AND column_name = 'available_countries'
+    ) THEN
+        ALTER TABLE track_reccobeats DROP COLUMN available_countries;
+    END IF;
+END $$;

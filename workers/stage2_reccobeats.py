@@ -50,12 +50,12 @@ def upsert_row(conn, payload: dict[str, object]) -> None:
         """
         INSERT INTO track_reccobeats (
             track_id, reccobeats_id, isrc, ean, upc, duration_ms,
-            available_countries, acousticness, danceability, energy,
+            acousticness, danceability, energy,
             instrumentalness, liveness, loudness, speechiness, tempo,
             valence, fetched_at, status
         ) VALUES (
             :track_id, :reccobeats_id, :isrc, :ean, :upc, :duration_ms,
-            :available_countries, :acousticness, :danceability, :energy,
+            :acousticness, :danceability, :energy,
             :instrumentalness, :liveness, :loudness, :speechiness, :tempo,
             :valence, :fetched_at, :status
         )
@@ -65,7 +65,6 @@ def upsert_row(conn, payload: dict[str, object]) -> None:
             ean                 = excluded.ean,
             upc                 = excluded.upc,
             duration_ms         = excluded.duration_ms,
-            available_countries = excluded.available_countries,
             acousticness        = excluded.acousticness,
             danceability        = excluded.danceability,
             energy              = excluded.energy,
@@ -106,7 +105,6 @@ def process_once(batch_size: int, logger) -> int:
                             "ean": None,
                             "upc": None,
                             "duration_ms": None,
-                            "available_countries": None,
                             "acousticness": None,
                             "danceability": None,
                             "energy": None,
@@ -135,7 +133,6 @@ def process_once(batch_size: int, logger) -> int:
                             "ean": None,
                             "upc": None,
                             "duration_ms": None,
-                            "available_countries": None,
                             "acousticness": None,
                             "danceability": None,
                             "energy": None,
@@ -192,7 +189,6 @@ def process_once(batch_size: int, logger) -> int:
                             "ean": metadata.ean,
                             "upc": metadata.upc,
                             "duration_ms": metadata.duration_ms,
-                            "available_countries": metadata.available_countries,
                             **features,
                             "fetched_at": fetched_at,
                             "status": status,
@@ -208,7 +204,6 @@ def process_once(batch_size: int, logger) -> int:
                         "ean": metadata.ean,
                         "upc": metadata.upc,
                         "duration_ms": metadata.duration_ms,
-                        "available_countries": metadata.available_countries,
                         **features,
                         "fetched_at": fetched_at,
                         "status": status,

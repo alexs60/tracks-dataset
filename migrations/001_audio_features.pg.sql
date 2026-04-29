@@ -122,12 +122,5 @@ GROUP BY
     a.bpm, a.key_key, a.key_scale, a.loudness_ebu128,
     a.danceability_raw, a.duration_sec;
 
--- Drop bloat column (idempotent via DO block)
-DO $$ BEGIN
-    IF EXISTS (
-        SELECT 1 FROM information_schema.columns
-        WHERE table_name = 'track_reccobeats' AND column_name = 'available_countries'
-    ) THEN
-        ALTER TABLE track_reccobeats DROP COLUMN available_countries;
-    END IF;
-END $$;
+-- Drop bloat column if it still exists (Postgres 9.0+ supports IF EXISTS on DROP COLUMN)
+ALTER TABLE track_reccobeats DROP COLUMN IF EXISTS available_countries;

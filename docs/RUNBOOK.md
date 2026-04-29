@@ -412,11 +412,29 @@ python scripts/reset_stage.py --stage 3 --all
 
 ## Part 6 — Export dataset
 
-Exports the chart data to Parquet and CSV for analysis or publication.
+Two export scripts, both supporting **SQLite or PostgreSQL** as the source.
+
+Backend selection (same for both scripts):
+
+- Pass `--database-url postgresql://user:pass@host/db`, **or**
+- set `DATABASE_URL` in the environment (auto-loaded from `.env`), **or**
+- fall back to SQLite (`--db <path>` for `csvexport.py`, or `DB_PATH` env var / default `kworb_italy.db` for `export_dataset.py`).
+
+### 6.1 — `export_dataset.py` (publishable Parquet/CSV bundle)
+
+Exports the bare `chart_entries` + `tracks` tables to Parquet and CSV plus a Frictionless `datapackage.json`.
 
 ```bash
 pip install pandas pyarrow
+
+# SQLite (uses DB_PATH env var or ./kworb_italy.db)
 python scripts/export_dataset.py
+
+# PostgreSQL via env var (loaded from .env)
+python scripts/export_dataset.py
+
+# PostgreSQL via flag (overrides DATABASE_URL)
+python scripts/export_dataset.py --database-url postgresql://user:pass@10.0.0.25/dbname
 ```
 
 Output in `dataset/`:
@@ -430,6 +448,39 @@ dataset/
   README.md
   datapackage.json
 ```
+
+### 6.2 — `csvexport.py` (enriched per-country CSV export)
+
+Joins `chart_entries` with the enrichment tables (`track_reccobeats`, `track_analysis`, `track_high_level_*`) and writes one CSV per country. By default a track is included only if `track_analysis.status='ok'` (the "Essentia data present" gate).
+
+```bash
+# SQLite, all countries, default output dir
+python scripts/csvexport.py --db /tmp/kworb_italy.db
+
+# Postgres via env var (DATABASE_URL from .env)
+python scripts/csvexport.py
+
+# Postgres via flag, IT only, gzipped
+python scripts/csvexport.py \
+    --database-url postgresql://user:pass@10.0.0.25/dbname \
+    --country IT --gzip
+
+# One row per track per country (most recent chart appearance)
+python scripts/csvexport.py --latest-only
+
+# Drop the Essentia gate (export every chart row, regardless of enrichment)
+python scripts/csvexport.py --no-essentia-gate
+
+# Also require Reccobeats data
+python scripts/csvexport.py --require-reccobeats
+
+# Date / streams filters
+python scripts/csvexport.py --since 2024-01-01 --min-streams 10000
+```
+
+Output: `exports/<timestamp>/charts_<country>.csv` (one file per country in `chart_entries`, unless `--country` narrows). Use `--out` to override the directory.
+
+Postgres connections from this script are opened in **read-only** mode, so the export can never block or interfere with the running enrichment pipeline.
 
 ---
 

@@ -9,9 +9,19 @@ Row gate:  track must have track_analysis.status='ok' (Essentia data present).
 Output:    exports/<timestamp>/charts_<country>.csv
            (one file per country found in chart_entries, unless --country narrows)
 
+Backends: SQLite (default) or PostgreSQL. Pass --database-url
+postgresql://user:pass@host/db (or set DATABASE_URL) to read from Postgres;
+otherwise pass --db <path-to-sqlite-file>.
+
 Examples:
-  # All countries, default output dir
+  # All countries, default output dir (SQLite)
   python export_csv.py --db ./db/charts.sqlite
+
+  # Read from Postgres
+  python export_csv.py --database-url postgresql://user:pass@host/charts
+
+  # Or via env var
+  DATABASE_URL=postgresql://user:pass@host/charts python export_csv.py
 
   # Just IT, gzipped
   python export_csv.py --db ./db/charts.sqlite --country IT --gzip
@@ -34,10 +44,12 @@ from __future__ import annotations
 import argparse
 import csv
 import gzip
+import os
 import sqlite3
 import sys
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 
 # ----------------------------------------------------------------------------
@@ -156,6 +168,15 @@ def build_select_sql(args: argparse.Namespace) -> tuple[str, list[str]]:
         where.append("t.total_streams >= ?")
     where_sql = "WHERE " + " AND ".join(where)
 
+    # Postgres requires every non-aggregated select column to appear in
+    # GROUP BY (SQLite is permissive). List them all so the same query runs
+    # on both backends.
+    group_by_parts = [
+        f"{tbl}.{col}"
+        for tbl, col, _ in CHART_COLS + TRACK_COLS + RECCOBEATS_COLS + ANALYSIS_COLS
+    ]
+    group_by_sql = ", ".join(group_by_parts)
+
     sql = f"""
         SELECT {select_sql}
         FROM chart_entries ce
@@ -165,7 +186,7 @@ def build_select_sql(args: argparse.Namespace) -> tuple[str, list[str]]:
         LEFT JOIN track_high_level_binary hb       ON hb.track_id = ce.track_id
         LEFT JOIN track_high_level_categorical hc  ON hc.track_id = ce.track_id
         {where_sql}
-        GROUP BY ce.track_id, ce.week_date, ce.country
+        GROUP BY {group_by_sql}
         ORDER BY ce.week_date DESC, ce.position ASC
     """
     return sql, header
@@ -174,14 +195,15 @@ def build_select_sql(args: argparse.Namespace) -> tuple[str, list[str]]:
 def build_latest_only_sql(args: argparse.Namespace) -> tuple[str, list[str]]:
     """One row per (track, country): the most recent chart_entries appearance."""
     inner_sql, header = build_select_sql(args)
+    # Subquery aliases (AS base / AS ranked) are required by Postgres.
     wrapped = f"""
         SELECT * FROM (
             SELECT *,
                    ROW_NUMBER() OVER (
                        PARTITION BY track_id ORDER BY week_date DESC, position ASC
                    ) AS rn
-            FROM ({inner_sql})
-        ) WHERE rn = 1
+            FROM ({inner_sql}) AS base
+        ) AS ranked WHERE rn = 1
     """
     return wrapped, header
 
@@ -189,17 +211,52 @@ def build_latest_only_sql(args: argparse.Namespace) -> tuple[str, list[str]]:
 # ----------------------------------------------------------------------------
 # I/O helpers
 # ----------------------------------------------------------------------------
-def open_db(db_path: Path) -> sqlite3.Connection:
-    """Open SQLite read-only via URI so the export never blocks worker writes."""
+class DbHandle:
+    """Minimal uniform handle over sqlite3 / psycopg2 connections."""
+
+    def __init__(self, raw: Any, backend: str) -> None:
+        self.raw = raw
+        self.backend = backend  # "sqlite" | "postgres"
+
+    def execute(self, sql: str, params: tuple = ()) -> Any:
+        if self.backend == "postgres":
+            cur = self.raw.cursor()
+            cur.execute(sql.replace("?", "%s"), params)
+            return cur
+        return self.raw.execute(sql, params)
+
+    def close(self) -> None:
+        self.raw.close()
+
+
+def open_db(args: argparse.Namespace) -> DbHandle:
+    """Open SQLite (read-only) or PostgreSQL based on flags / env."""
+    db_url = args.database_url or os.environ.get("DATABASE_URL")
+    if db_url:
+        if not db_url.startswith(("postgresql://", "postgres://")):
+            sys.exit(f"Unsupported database URL scheme: {db_url}")
+        try:
+            import psycopg2
+        except ImportError:
+            sys.exit("psycopg2 is required for Postgres. pip install psycopg2-binary")
+        # Read-only session prevents accidental writes from this script.
+        conn = psycopg2.connect(db_url)
+        conn.set_session(readonly=True, autocommit=True)
+        return DbHandle(conn, "postgres")
+
+    if args.db is None:
+        sys.exit("Provide --db <sqlite-path> or --database-url / DATABASE_URL")
+    db_path: Path = args.db
     if not db_path.exists():
         sys.exit(f"DB not found: {db_path}")
+    # Open SQLite read-only via URI so the export never blocks worker writes.
     uri = f"file:{db_path.resolve()}?mode=ro"
     conn = sqlite3.connect(uri, uri=True)
     conn.row_factory = sqlite3.Row
-    return conn
+    return DbHandle(conn, "sqlite")
 
 
-def list_countries(conn: sqlite3.Connection) -> list[str]:
+def list_countries(conn: DbHandle) -> list[str]:
     cur = conn.execute(
         "SELECT DISTINCT country FROM chart_entries ORDER BY country"
     )
@@ -216,7 +273,7 @@ def open_writer(path: Path, gzip_output: bool):
 
 
 def export_country(
-    conn: sqlite3.Connection,
+    conn: DbHandle,
     country: str,
     out_dir: Path,
     args: argparse.Namespace,
@@ -259,7 +316,11 @@ def parse_args() -> argparse.Namespace:
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    p.add_argument("--db", required=True, type=Path, help="Path to SQLite DB")
+    p.add_argument("--db", type=Path, default=None,
+                   help="Path to SQLite DB (omit when using --database-url).")
+    p.add_argument("--database-url", type=str, default=None,
+                   help="PostgreSQL URL (postgresql://user:pass@host/db). "
+                        "Falls back to the DATABASE_URL env var.")
     p.add_argument("--out", type=Path, default=None,
                    help="Output dir (default: ./exports/<timestamp>/)")
     p.add_argument("--gzip", action="store_true", help="gzip the CSVs")
@@ -291,7 +352,7 @@ def main() -> None:
         args.out = Path("exports") / ts
     args.out.mkdir(parents=True, exist_ok=True)
 
-    conn = open_db(args.db)
+    conn = open_db(args)
 
     countries = args.country or list_countries(conn)
     if not countries:
@@ -302,7 +363,13 @@ def main() -> None:
         gate += " + reccobeats ok"
     shape = "latest per (track,country)" if args.latest_only else "one row per chart entry"
 
-    print(f"DB:        {args.db}")
+    if conn.backend == "postgres":
+        # Don't echo the URL — it may contain credentials.
+        source = "postgres (DATABASE_URL)" if not args.database_url else "postgres (--database-url)"
+    else:
+        source = str(args.db)
+
+    print(f"DB:        {source}")
     print(f"Out:       {args.out}")
     print(f"Countries: {', '.join(countries)}")
     print(f"Gate:      {gate}")
@@ -315,6 +382,7 @@ def main() -> None:
         total += n
         print(f"  {path.name}: {n} rows")
     print(f"\nTotal: {total} rows across {len(countries)} file(s).")
+    conn.close()
 
 
 if __name__ == "__main__":

@@ -1,6 +1,6 @@
 """
-Export the scraped Kworb data from the SQLite working cache into a
-publishable, citable dataset:
+Export the scraped Kworb data from a working DB cache into a publishable,
+citable dataset:
 
     dataset/
         chart_entries.parquet     # fact table (long format)
@@ -10,9 +10,16 @@ publishable, citable dataset:
         README.md
         datapackage.json          # Frictionless Data descriptor
 
+Backends: SQLite (default) or PostgreSQL.
+  - SQLite: defaults to ./kworb_italy.db, override with DB_PATH env var.
+  - Postgres: set DATABASE_URL=postgresql://user:pass@host/db
+    (or pass --database-url on the command line).
+
 Usage:
     pip install pandas pyarrow
     python export_dataset.py
+    DATABASE_URL=postgresql://user:pass@host/charts python export_dataset.py
+    python export_dataset.py --database-url postgresql://user:pass@host/charts
 
 The Parquet files are what you'll actually use for analysis.
 The CSVs + datapackage.json are for the paper / Zenodo upload.
@@ -20,16 +27,48 @@ The CSVs + datapackage.json are for the paper / Zenodo upload.
 
 from __future__ import annotations
 
+import argparse
+import contextlib
 import json
+import os
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Iterator
 
 import pandas as pd
 
-DB_PATH = Path("kworb_italy.db")
+DB_PATH = Path(os.environ.get("DB_PATH", "kworb_italy.db"))
 OUT_DIR = Path("dataset")
 COUNTRY_FILTER: list[str] | None = None  # e.g. ["IT"] to publish IT-only
+
+
+@contextlib.contextmanager
+def open_conn(database_url: str | None = None) -> Iterator:
+    """Yield a DB-API connection for SQLite or PostgreSQL.
+
+    Selection order: explicit --database-url > DATABASE_URL env > SQLite at DB_PATH.
+    pandas.read_sql_query accepts either backend's connection.
+    """
+    url = database_url or os.environ.get("DATABASE_URL")
+    if url and url.startswith(("postgresql://", "postgres://")):
+        try:
+            import psycopg2
+        except ImportError as exc:
+            raise SystemExit(
+                "psycopg2 is required for Postgres. pip install psycopg2-binary"
+            ) from exc
+        conn = psycopg2.connect(url)
+        try:
+            yield conn
+        finally:
+            conn.close()
+        return
+
+    if not DB_PATH.exists():
+        raise SystemExit(f"Cache DB not found: {DB_PATH}. Run the scraper first.")
+    with sqlite3.connect(DB_PATH) as conn:
+        yield conn
 
 DATASET_VERSION = "1.0.0"
 DATASET_TITLE = "Spotify Weekly Charts — Italy (2013–present)"
@@ -39,7 +78,7 @@ DATASET_DESCRIPTION = (
 )
 
 
-def load_frames(conn: sqlite3.Connection) -> tuple[pd.DataFrame, pd.DataFrame]:
+def load_frames(conn) -> tuple[pd.DataFrame, pd.DataFrame]:
     entries = pd.read_sql_query(
         "SELECT track_id, week_date, country, position, streams "
         "FROM chart_entries",
@@ -238,10 +277,18 @@ def write_datapackage(entries: pd.DataFrame, tracks: pd.DataFrame) -> None:
     (OUT_DIR / "datapackage.json").write_text(json.dumps(pkg, indent=2), encoding="utf-8")
 
 
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--database-url", type=str, default=None,
+                   help="PostgreSQL URL (postgresql://user:pass@host/db). "
+                        "Falls back to the DATABASE_URL env var, then SQLite at DB_PATH.")
+    return p.parse_args()
+
+
 def main() -> None:
-    if not DB_PATH.exists():
-        raise SystemExit(f"Cache DB not found: {DB_PATH}. Run the scraper first.")
-    with sqlite3.connect(DB_PATH) as conn:
+    args = parse_args()
+    with open_conn(args.database_url) as conn:
         entries, tracks = load_frames(conn)
     write_files(entries, tracks)
     write_readme(entries, tracks)

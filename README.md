@@ -30,8 +30,8 @@ scripts/
   run_migrations.py           # apply migrations to the target database
   status.py                   # print per-stage coverage counts
   reset_stage.py              # reset one stage for one or all tracks
-  export_dataset.py           # export chart data to Parquet/CSV for analysis
-  csvexport.py                # export enriched tracks to per-country CSV files
+  export_dataset.py           # export chart data to Parquet/CSV (SQLite or Postgres)
+  csvexport.py                # export enriched tracks to per-country CSV (SQLite or Postgres)
 
 docs/
   RUNBOOK.md                  # step-by-step operating guide

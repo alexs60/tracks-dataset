@@ -6,4 +6,4 @@ services:
     network_mode: host
     volumes:
       - ./logs:/app/logs
-    command: python workers/run_pipeline.py --batch-size 10 --interval 60
+    command: python workers/run_pipeline.py --batch-size 10 --interval 30

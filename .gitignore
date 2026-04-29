@@ -4,3 +4,6 @@
 .env
 .venv
 .git
+/logs
+/workers/__pycache__/
+/workers/lib/__pycache__/

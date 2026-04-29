@@ -68,7 +68,6 @@ RECCOBEATS_COLS = [
     ("rb", "ean",                 "ean"),
     ("rb", "upc",                 "upc"),
     ("rb", "duration_ms",         "duration_ms"),
-    ("rb", "available_countries", "available_countries"),
     ("rb", "acousticness",        "rb_acousticness"),
     ("rb", "danceability",        "rb_danceability"),
     ("rb", "energy",              "rb_energy"),

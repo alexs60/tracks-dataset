@@ -45,7 +45,7 @@ def claim_batch(conn, batch_size: int) -> list[str]:
 
 
 def process_once(batch_size: int, logger) -> int:
-    qps = float(os.environ.get("WORKER_RATE_LIMIT_QPS", "1"))
+    qps = float(os.environ.get("STAGE1_RATE_LIMIT_QPS", os.environ.get("WORKER_RATE_LIMIT_QPS", "1")))
     limiter = SimpleRateLimiter(qps=qps)
     client = httpx.Client(headers={"User-Agent": get_embed_user_agent()}, timeout=30.0)
 

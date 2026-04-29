@@ -82,7 +82,7 @@ def upsert_row(conn, payload: dict[str, object]) -> None:
 
 
 def process_once(batch_size: int, logger) -> int:
-    qps = float(os.environ.get("WORKER_RATE_LIMIT_QPS", "1"))
+    qps = float(os.environ.get("STAGE2_RATE_LIMIT_QPS", os.environ.get("WORKER_RATE_LIMIT_QPS", "1")))
     limiter = SimpleRateLimiter(qps=qps)
     client = httpx.Client(timeout=30.0)
     try:

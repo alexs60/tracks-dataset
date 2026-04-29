@@ -14,15 +14,22 @@ from workers.lib.db import connect, is_postgres, load_sql_file, run_migrations
 load_repo_env(PROJECT_ROOT)
 
 
+def discover_migrations() -> list[Path]:
+    migrations_dir = Path("migrations")
+    if is_postgres():
+        return sorted(migrations_dir.glob("*.pg.sql"))
+    return sorted(p for p in migrations_dir.glob("*.sql") if not p.name.endswith(".pg.sql"))
+
+
 def main() -> None:
-    sql_path = Path(
-        "migrations/001_audio_features.pg.sql" if is_postgres()
-        else "migrations/001_audio_features.sql"
-    )
-    sql_text = load_sql_file(sql_path)
+    paths = discover_migrations()
+    if not paths:
+        print("No migrations found")
+        return
     with connect() as conn:
-        run_migrations(conn, sql_text)
-    print(f"Applied migrations from {sql_path}")
+        for path in paths:
+            run_migrations(conn, load_sql_file(path))
+            print(f"Applied migrations from {path}")
 
 
 if __name__ == "__main__":

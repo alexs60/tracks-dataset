@@ -32,7 +32,20 @@ def main() -> None:
         stage2_failed = scalar(conn, "SELECT COUNT(*) FROM track_reccobeats WHERE status = 'failed'")
         stage2_pending = max(total - (stage2_ok + stage2_not_found + stage2_no_features + stage2_failed), 0)
 
-        stage2_1_total = scalar(conn, "SELECT COUNT(*) FROM track_audio_features_external")
+        # Stage 2.1 universe = tracks where Reccobeats did NOT return 'ok' (so the
+        # fallback is the only way these tracks get audio scalars). Of that
+        # universe: 'ok' = filled by fallback, 'pending' = still missing.
+        stage2_1_ok = scalar(
+            conn,
+            """
+            SELECT COUNT(*)
+            FROM track_audio_features_external ext
+            LEFT JOIN track_reccobeats rb ON rb.track_id = ext.track_id
+            WHERE rb.track_id IS NULL OR rb.status != 'ok'
+            """,
+        )
+        stage2_1_universe = stage2_not_found + stage2_no_features + stage2_failed + stage2_pending
+        stage2_1_pending = max(stage2_1_universe - stage2_1_ok, 0)
         source_rows = conn.execute(
             "SELECT source, COUNT(*) FROM track_audio_features_external GROUP BY source ORDER BY source"
         ).fetchall()
@@ -50,25 +63,8 @@ def main() -> None:
             """,
         )
 
-        # "Audio features available" = Reccobeats ok OR external fallback row present.
-        # By design fill_external_features.py only fills non-ok Reccobeats tracks,
-        # but the EXISTS form is correct even if that ever overlaps.
-        audio_features_total = scalar(
-            conn,
-            """
-            SELECT COUNT(*)
-            FROM tracks t
-            WHERE EXISTS (
-                SELECT 1 FROM track_reccobeats rb
-                WHERE rb.track_id = t.track_id AND rb.status = 'ok'
-            )
-            OR EXISTS (
-                SELECT 1 FROM track_audio_features_external ext
-                WHERE ext.track_id = t.track_id
-            )
-            """,
-        )
-
+        # End-to-end success: track has audio scalars (Reccobeats 'ok' OR an
+        # external-fallback row) AND a successful Essentia analysis.
         fully_enriched = scalar(
             conn,
             """
@@ -90,7 +86,6 @@ def main() -> None:
         )
 
     pct = (fully_enriched / total * 100.0) if total else 0.0
-    af_pct = (audio_features_total / total * 100.0) if total else 0.0
     print(f"Tracks total:                  {total:,}")
     print(
         "Stage 1 (Spotify preview):     "
@@ -107,12 +102,14 @@ def main() -> None:
         f" ({', '.join(f'{src}={n:,}' for src, n in stage2_1_sources)})"
         if stage2_1_sources else ""
     )
-    print(f"Stage 2.1 (External fallback): {stage2_1_total:,} filled{sources_suffix}")
+    print(
+        "Stage 2.1 (External fallback): "
+        f"{stage2_1_ok:,} ok | {stage2_1_pending:,} pending{sources_suffix}"
+    )
     print(
         "Stage 3 (Essentia):            "
         f"{stage3_ok:,} ok | {stage3_failed:,} failed | {stage3_pending:,} pending"
     )
-    print(f"Audio features available:      {audio_features_total:,} ({af_pct:.1f}%)")
     print(f"Fully enriched:                {fully_enriched:,} ({pct:.1f}%)")
 
 

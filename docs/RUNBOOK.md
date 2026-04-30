@@ -448,6 +448,81 @@ CSV.
 
 ---
 
+## Part 4.2 — Stage 2.2: Essentia-derived scalars (automatic)
+
+Stage 2.2 fills the same `track_audio_features_external` table as Stage 2.1, but
+the values come from the Stage 3 Essentia output rather than an external CSV.
+It runs **automatically** as part of `run_pipeline.py`, immediately after Stage
+3, and only writes rows for tracks where:
+
+- `track_analysis.status = 'ok'` (Stage 3 completed)
+- Reccobeats did **not** return `ok` (Stage 2 missed the track)
+- No external row exists yet (Stage 2.1 fills win — see priority below)
+
+The new rows are tagged `source='essentia_derived'`, `matched_by='essentia'`.
+
+### Derivation formulas
+
+| Spotify scalar | Source | Formula |
+|---|---|---|
+| `acousticness` (0..1) | binary classifier | `mood_acoustic.prob_positive` |
+| `danceability` (0..1) | binary classifier | `danceability.prob_positive` |
+| `energy` (0..1) | derived | mean of `clip((loudness_ebu128 + 60) / 60, 0, 1)` and `1 - mood_relaxed.prob_positive` |
+| `instrumentalness` (0..1) | binary classifier | `1 - voice_instrumental.prob_positive` |
+| `liveness` (0..1) | — | NULL (no clean Essentia proxy) |
+| `loudness` (dB) | low-level | `loudness_ebu128` |
+| `speechiness` (0..1) | — | NULL (no clean Essentia proxy) |
+| `tempo` (BPM) | low-level | `bpm` |
+| `valence` (0..1) | derived | `(mood_happy.prob_positive - mood_sad.prob_positive + 1) / 2` |
+
+These are proxies, not Spotify's actual values. They're a reasonable substitute
+for clustering/filtering on Italian charts, but not for cross-comparison with
+public Spotify-features datasets — use the merged view's `audio_features_source`
+column to tell which rows are Reccobeats / CSV / `essentia_derived`.
+
+### Priority (when a track has multiple sources)
+
+1. Reccobeats `ok` — preferred by `v_track_audio_features_merged`
+2. CSV fallback (`kaggle_*` etc.) — fills only when Reccobeats is not `ok`
+3. Essentia-derived — fills only when neither of the above produced a row
+
+Stage 2.2 uses `ON CONFLICT (track_id) DO NOTHING`, so it never overwrites a
+Stage 2.1 row. Conversely, `fill_external_features.py` uses `ON CONFLICT DO
+UPDATE`, so loading a Kaggle dump *will* overwrite a previous `essentia_derived`
+row for the same track — the more authoritative source wins.
+
+### Running it manually
+
+The pipeline runner (`workers/run_pipeline.py`) calls Stage 2.2 every pass.
+For a one-shot drain or testing, run it directly:
+
+```bash
+# One pass (default 50 tracks)
+python workers/stage2_2_essentia_derived.py
+
+# Drain everything
+python workers/stage2_2_essentia_derived.py --loop --batch-size 500
+```
+
+### Verifying
+
+```bash
+python scripts/status.py
+```
+
+The `Stage 2.1 (External fallback)` line shows the per-source breakdown,
+including `essentia_derived=N`. That count plus any `kaggle_*` counts gives the
+total filled-by-fallback. Tracks counted under `pending` are tracks Reccobeats
+missed *and* Stage 2.2 hasn't been able to derive yet (typically because
+Stage 3 hasn't completed on them).
+
+### Resetting
+
+See Part 5. `--stage 2.2 --all` clears only `essentia_derived` rows, so any
+Kaggle CSV fills survive untouched.
+
+---
+
 ## Part 5 — Administrative operations
 
 ### Reset a single track
@@ -461,8 +536,11 @@ python scripts/reset_stage.py --stage 1 --track-id SPOTIFY_TRACK_ID
 # Reset Stage 2 for one track
 python scripts/reset_stage.py --stage 2 --track-id SPOTIFY_TRACK_ID
 
-# Reset Stage 2.1 (external fallback) for one track
+# Reset Stage 2.1 (external fallback — clears ALL external rows for the track)
 python scripts/reset_stage.py --stage 2.1 --track-id SPOTIFY_TRACK_ID
+
+# Reset Stage 2.2 (only essentia_derived rows — preserves Kaggle CSV fills)
+python scripts/reset_stage.py --stage 2.2 --track-id SPOTIFY_TRACK_ID
 
 # Reset Stage 3 for one track
 python scripts/reset_stage.py --stage 3 --track-id SPOTIFY_TRACK_ID
@@ -475,10 +553,16 @@ Wipes all results for the given stage (e.g. after a schema change or parser fix)
 ```bash
 python scripts/reset_stage.py --stage 3 --all
 
-# Stage 2.1: clears track_audio_features_external; leaves the
-# external_audio_features_raw staging table intact, so re-running
-# fill_external_features.py is enough — no need to reload the CSV.
+# Stage 2.1: clears all rows in track_audio_features_external (CSV fills AND
+# essentia_derived). Leaves the external_audio_features_raw staging table
+# intact, so re-running fill_external_features.py is enough — no need to
+# reload the CSV.
 python scripts/reset_stage.py --stage 2.1 --all
+
+# Stage 2.2: clears only rows with source='essentia_derived'. Useful after
+# changing the derivation formulas in stage2_2_essentia_derived.py — Kaggle
+# CSV fills survive.
+python scripts/reset_stage.py --stage 2.2 --all
 ```
 
 ### Stage status meanings
@@ -493,6 +577,7 @@ python scripts/reset_stage.py --stage 2.1 --all
 | 2 | `no_features` | Track in catalogue but no audio features |
 | 2 | `failed` | API error |
 | 2.1 | (row present) | Audio features filled from external CSV (only for tracks where Stage 2 didn't return `ok`). The `source` column records which CSV; `matched_by` records `spotify_id` or `isrc`. |
+| 2.2 | (row with `source='essentia_derived'`) | Spotify-style scalars derived from the Stage 3 Essentia output. Only written when Reccobeats != `ok` AND no other external row exists. `liveness` and `speechiness` are always NULL — no clean Essentia proxy. |
 | 3 | `ok` | Essentia SVM descriptors stored |
 | 3 | `failed` | Download or API error |
 

@@ -16,9 +16,10 @@ scraper/
   kworb_italy_scraper.py      # kworb.net chart scraper
 
 workers/
-  run_pipeline.py             # loop runner: executes all three stages in sequence
+  run_pipeline.py             # loop runner: executes all stages in sequence
   stage1_spotify_previews.py  # Stage 1: resolve Spotify preview CDN URLs
   stage2_reccobeats.py        # Stage 2: fetch Reccobeats metadata & scalars
+  stage2_2_essentia_derived.py # Stage 2.2: derive Spotify-style scalars from Essentia output
   stage3_essentia.py          # Stage 3: Essentia SVM analysis via remote API
   lib/                        # shared library (db, env, logging, http helpers)
 
@@ -31,7 +32,7 @@ migrations/
 scripts/
   run_migrations.py           # apply migrations to the target database
   status.py                   # print per-stage coverage counts
-  reset_stage.py              # reset one stage (1, 2, 2.1, 3) for one or all tracks
+  reset_stage.py              # reset one stage (1, 2, 2.1, 2.2, 3) for one or all tracks
   export_dataset.py           # export chart data to Parquet/CSV (SQLite or Postgres)
   csvexport.py                # export enriched tracks to per-country CSV (SQLite or Postgres)
   load_external_features.py   # Stage 2.1: load a Spotify-features CSV into the staging table
@@ -90,8 +91,9 @@ The enrichment pipeline never touches `kworb_italy.db` directly. Always set `DB_
 | 2 | `stage2_reccobeats.py` | Fetches Reccobeats track metadata and audio feature scalars |
 | 2.1 | `load_external_features.py` + `fill_external_features.py` | Manual fallback: load a Spotify-features CSV (e.g. Kaggle dump), then fill `track_audio_features_external` for tracks where Reccobeats came back `not_found`/`no_features`/`failed`. Optional. |
 | 3 | `stage3_essentia.py` | Downloads the preview mp3, POSTs it to the remote Essentia SVM API, stores descriptors |
+| 2.2 | `stage2_2_essentia_derived.py` | Automatic fallback: derives Spotify-style scalars (acousticness, danceability, energy, instrumentalness, loudness, tempo, valence) from the Stage 3 Essentia output for tracks Reccobeats missed. Runs after Stage 3 in `run_pipeline.py`. |
 
-Each stage claims only tracks that the previous stage completed. Stages are independent and idempotent — re-running a stage skips already-processed tracks. Stage 2.1 is operator-run (not part of `run_pipeline.py`); use it when Reccobeats coverage isn't sufficient and you have an external CSV that fills the gap.
+Each stage claims only tracks that the previous stage completed. Stages are independent and idempotent — re-running a stage skips already-processed tracks. Stage 2.1 is operator-run (not part of `run_pipeline.py`); use it when you have an external CSV that fills the gap. Stage 2.2 is automatic and depends on Stage 3, so it kicks in once a Reccobeats-missing track has a successful Essentia analysis. Stage 2.2 never overwrites a Stage 2.1 fill — Kaggle data wins over derived values when both are present.
 
 ---
 

@@ -15,13 +15,17 @@ from workers.lib.db import connect, transaction
 load_repo_env(PROJECT_ROOT)
 
 
-STAGE_CHOICES = ["1", "2", "2.1", "3"]
+STAGE_CHOICES = ["1", "2", "2.1", "2.2", "3"]
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--stage", required=True, choices=STAGE_CHOICES,
-                        help="Stage to reset. '2.1' clears track_audio_features_external (the external CSV fallback).")
+                        help=(
+                            "Stage to reset. '2.1' clears track_audio_features_external "
+                            "(all external fallback rows, CSV and derived). "
+                            "'2.2' clears only rows with source='essentia_derived'."
+                        ))
     parser.add_argument("--track-id")
     parser.add_argument("--all", action="store_true")
     args = parser.parse_args()
@@ -56,6 +60,22 @@ def reset_stage_2_1(conn, args: argparse.Namespace) -> None:
     conn.execute(f"DELETE FROM track_audio_features_external{clause}", params)
 
 
+def reset_stage_2_2(conn, args: argparse.Namespace) -> None:
+    """Clear only the Essentia-derived rows from track_audio_features_external.
+    Leaves Kaggle/CSV-imported fills (Stage 2.1) intact."""
+    if args.all:
+        conn.execute(
+            "DELETE FROM track_audio_features_external WHERE source = ?",
+            ("essentia_derived",),
+        )
+    else:
+        conn.execute(
+            "DELETE FROM track_audio_features_external "
+            "WHERE track_id = ? AND source = ?",
+            (args.track_id, "essentia_derived"),
+        )
+
+
 def reset_stage_3(conn, args: argparse.Namespace) -> None:
     clause, params = where_clause(args)
     conn.execute(f"DELETE FROM track_high_level_class_probs{clause}", params)
@@ -70,6 +90,7 @@ STAGE_HANDLERS = {
     "1": reset_stage_1,
     "2": reset_stage_2,
     "2.1": reset_stage_2_1,
+    "2.2": reset_stage_2_2,
     "3": reset_stage_3,
 }
 

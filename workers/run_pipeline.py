@@ -17,6 +17,7 @@ load_repo_env(PROJECT_ROOT)
 
 import workers.stage1_spotify_previews as s1
 import workers.stage2_reccobeats as s2
+import workers.stage2_2_essentia_derived as s2_2
 import workers.stage3_essentia as s3
 
 
@@ -32,6 +33,7 @@ def main() -> None:
 
     logger1 = configure_json_logger("stage1", Path("logs/stage1.log"))
     logger2 = configure_json_logger("stage2", Path("logs/stage2.log"))
+    logger2_2 = configure_json_logger("stage2_2", Path("logs/stage2_2.log"))
     logger3 = configure_json_logger("stage3", Path("logs/stage3.log"))
     pipeline_logger = configure_json_logger("pipeline", Path("logs/pipeline.log"))
 
@@ -41,7 +43,10 @@ def main() -> None:
         n1 = s1.process_once(args.batch_size, logger1)
         n2 = s2.process_once(args.batch_size, logger2)
         n3 = s3.process_once(args.batch_size, logger3)
-        log_event(pipeline_logger, event="pass", n1=n1, n2=n2, n3=n3)
+        # Stage 2.2 must run after Stage 3: it derives Spotify-style scalars
+        # from the Essentia output for tracks Reccobeats missed.
+        n2_2 = s2_2.process_once(args.batch_size, logger2_2)
+        log_event(pipeline_logger, event="pass", n1=n1, n2=n2, n3=n3, n2_2=n2_2)
         time.sleep(args.interval)
 
 

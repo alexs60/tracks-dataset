@@ -32,10 +32,10 @@ def main() -> None:
         stage2_failed = scalar(conn, "SELECT COUNT(*) FROM track_reccobeats WHERE status = 'failed'")
         stage2_pending = max(total - (stage2_ok + stage2_not_found + stage2_no_features + stage2_failed), 0)
 
-        # Stage 2.1 universe = tracks where Reccobeats did NOT return 'ok' (so the
+        # Fallback universe = tracks where Reccobeats did NOT return 'ok' (so a
         # fallback is the only way these tracks get audio scalars). Of that
-        # universe: 'ok' = filled by fallback, 'pending' = still missing.
-        stage2_1_ok = scalar(
+        # universe: 'filled' = has any external row, 'pending' = still missing.
+        fallback_filled = scalar(
             conn,
             """
             SELECT COUNT(*)
@@ -44,12 +44,39 @@ def main() -> None:
             WHERE rb.track_id IS NULL OR rb.status != 'ok'
             """,
         )
-        stage2_1_universe = stage2_not_found + stage2_no_features + stage2_failed + stage2_pending
-        stage2_1_pending = max(stage2_1_universe - stage2_1_ok, 0)
+        fallback_universe = stage2_not_found + stage2_no_features + stage2_failed + stage2_pending
+        fallback_pending = max(fallback_universe - fallback_filled, 0)
         source_rows = conn.execute(
             "SELECT source, COUNT(*) FROM track_audio_features_external GROUP BY source ORDER BY source"
         ).fetchall()
-        stage2_1_sources = [(row[0], int(row[1])) for row in source_rows]
+        fallback_sources = [(row[0], int(row[1])) for row in source_rows]
+
+        # Stage 2.2 split: how many of the fallback-filled rows came from the
+        # automatic Essentia derivation, and how many tracks are still waiting
+        # on Stage 3 before Stage 2.2 can fill them.
+        stage2_2_filled = scalar(
+            conn,
+            """
+            SELECT COUNT(*)
+            FROM track_audio_features_external ext
+            LEFT JOIN track_reccobeats rb ON rb.track_id = ext.track_id
+            WHERE ext.source = 'essentia_derived'
+              AND (rb.status IS NULL OR rb.status != 'ok')
+            """,
+        )
+        stage2_2_awaiting_stage3 = scalar(
+            conn,
+            """
+            SELECT COUNT(*)
+            FROM tracks t
+            LEFT JOIN track_reccobeats rb ON rb.track_id = t.track_id
+            LEFT JOIN track_audio_features_external ext ON ext.track_id = t.track_id
+            LEFT JOIN track_analysis a ON a.track_id = t.track_id AND a.status = 'ok'
+            WHERE (rb.status IS NULL OR rb.status != 'ok')
+              AND ext.track_id IS NULL
+              AND a.track_id IS NULL
+            """,
+        )
 
         stage3_ok = scalar(conn, "SELECT COUNT(*) FROM track_analysis WHERE status = 'ok'")
         stage3_failed = scalar(conn, "SELECT COUNT(*) FROM track_analysis WHERE status = 'failed'")
@@ -99,12 +126,16 @@ def main() -> None:
         f"{stage2_pending:,} pending"
     )
     sources_suffix = (
-        f" ({', '.join(f'{src}={n:,}' for src, n in stage2_1_sources)})"
-        if stage2_1_sources else ""
+        f" ({', '.join(f'{src}={n:,}' for src, n in fallback_sources)})"
+        if fallback_sources else ""
     )
     print(
-        "Stage 2.1 (External fallback): "
-        f"{stage2_1_ok:,} ok | {stage2_1_pending:,} pending{sources_suffix}"
+        "Stage 2.1+2.2 (Fallback fill): "
+        f"{fallback_filled:,} filled | {fallback_pending:,} pending{sources_suffix}"
+    )
+    print(
+        "Stage 2.2 (Essentia derived):  "
+        f"{stage2_2_filled:,} filled | {stage2_2_awaiting_stage3:,} awaiting Stage 3"
     )
     print(
         "Stage 3 (Essentia):            "

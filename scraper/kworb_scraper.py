@@ -57,7 +57,25 @@ REQUEST_DELAY = 1.0
 FRESHNESS_DAYS = 90
 DORMANT_DAYS = 60
 
-DEFAULT_COUNTRIES = ["IT", "ES", "FR", "DE", "GB", "US", "PT", "NL"]
+# Broad European + Russia + US coverage. The scraper handles per-country
+# fetch errors gracefully — any country kworb doesn't host (404) is logged
+# and skipped, so this list can include speculative entries safely.
+DEFAULT_COUNTRIES = [
+    # Western Europe
+    "GB", "IE", "FR", "DE", "NL", "BE", "LU", "AT", "CH",
+    # Iberia / Mediterranean / South
+    "IT", "ES", "PT", "GR",
+    # Nordics / Scandinavia
+    "SE", "NO", "DK", "FI", "IS",
+    # Baltics
+    "EE", "LV", "LT",
+    # Central / Eastern Europe
+    "PL", "CZ", "SK", "HU", "RO", "BG",
+    # Russia
+    "RU",
+    # Americas
+    "US",
+]
 
 TRACK_HREF_RE = re.compile(r"(?:^|/)track/([A-Za-z0-9]+)\.html")
 ARTIST_HREF_RE = re.compile(r"(?:^|/)artist/([A-Za-z0-9]+)\.html")
@@ -397,31 +415,37 @@ def discover_country(client: httpx.Client, country: str, *, debug: bool) -> list
     return rows
 
 
-def main() -> None:
-    load_repo_env(PROJECT_ROOT)
+def run(
+    *,
+    countries: list[str] | None = None,
+    max_age_days: int = FRESHNESS_DAYS,
+    force: bool = False,
+    limit: int | None = None,
+    debug: bool = False,
+) -> dict:
+    """Programmatic entry point. Returns a summary dict suitable for logging.
 
-    ap = argparse.ArgumentParser(
-        description="Multi-country kworb.net Spotify chart scraper."
-    )
-    ap.add_argument(
-        "--country", nargs="+", default=DEFAULT_COUNTRIES,
-        metavar="CC",
-        help=f"ISO-2 country codes to scrape (default: {' '.join(DEFAULT_COUNTRIES)})",
-    )
-    ap.add_argument("--debug", action="store_true",
-                    help="dump totals_*_debug.html for each country and print "
-                         "table diagnostics, then exit before track scraping")
-    ap.add_argument("--limit", type=int, default=None,
-                    help="only scrape the first N candidate tracks (smoke test)")
-    ap.add_argument("--max-age-days", type=int, default=FRESHNESS_DAYS,
-                    help=f"skip tracks scraped within this many days "
-                         f"(default: {FRESHNESS_DAYS})")
-    ap.add_argument("--force", action="store_true",
-                    help="re-scrape every track regardless of cache age")
-    args = ap.parse_args()
+    Phases:
+      1. discovery — fetch each country's totals page, collect track ids
+      2. persist totals — upsert tracks + track_country_totals
+      3. track-page scraping — fetch each non-fresh track's history page
 
-    countries = [c.upper() for c in args.country]
+    Errors fetching one country's totals page are logged and skipped; errors
+    on individual track pages are logged and skipped. The function only
+    raises if something prevents any work from happening at all (e.g. DB
+    connect failure).
+    """
+    countries = [c.upper() for c in (countries or DEFAULT_COUNTRIES)]
     now = utc_now_iso()
+    summary: dict = {
+        "countries": countries,
+        "discovered_tracks": 0,
+        "scraped_tracks": 0,
+        "track_errors": 0,
+        "country_errors": 0,
+        "skipped_fresh": 0,
+        "skipped_dormant": 0,
+    }
 
     with httpx.Client(headers={"User-Agent": USER_AGENT},
                       follow_redirects=True) as client:
@@ -432,9 +456,10 @@ def main() -> None:
 
         for cc in countries:
             try:
-                rows = discover_country(client, cc, debug=args.debug)
+                rows = discover_country(client, cc, debug=debug)
             except Exception as exc:
                 print(f"    ERROR fetching {cc}: {exc}", file=sys.stderr)
+                summary["country_errors"] += 1
                 continue
             for r in rows:
                 core_by_id[r["track_id"]] = {
@@ -453,15 +478,16 @@ def main() -> None:
                 })
             time.sleep(REQUEST_DELAY)
 
+        summary["discovered_tracks"] = len(core_by_id)
         print(f"Discovered {len(core_by_id)} unique tracks "
               f"across {len(countries)} countries.")
 
-        if args.debug:
-            return
+        if debug:
+            return summary
 
         if not core_by_id:
             print("Nothing to do.")
-            return
+            return summary
 
         # ----- Phase 2: persist totals -----
         with connect() as conn:
@@ -476,14 +502,17 @@ def main() -> None:
             unique_ids = list(core_by_id.keys())
             decisions = [
                 (tid, *needs_scrape(conn, tid,
-                                    max_age_days=args.max_age_days,
-                                    force=args.force))
+                                    max_age_days=max_age_days,
+                                    force=force))
                 for tid in unique_ids
             ]
             reason_counts = Counter(r for _, _, r in decisions)
             to_scrape = [tid for tid, should, _ in decisions if should]
-            if args.limit is not None:
-                to_scrape = to_scrape[: args.limit]
+            if limit is not None:
+                to_scrape = to_scrape[: limit]
+
+            summary["skipped_fresh"] = reason_counts.get("fresh", 0)
+            summary["skipped_dormant"] = reason_counts.get("dormant", 0)
 
             print("Cache decision breakdown:")
             for reason in ("new", "stale", "forced", "fresh", "dormant"):
@@ -492,8 +521,8 @@ def main() -> None:
                     action = "scrape" if reason in ("new", "stale", "forced") else "skip"
                     print(f"  {reason:8s} ({action}): {n:5d}")
             print(f"Will scrape {len(to_scrape)} tracks "
-                  f"(threshold: {args.max_age_days} days"
-                  f"{', forced' if args.force else ''}).")
+                  f"(threshold: {max_age_days} days"
+                  f"{', forced' if force else ''}).")
 
             for tid in tqdm(to_scrape, desc="tracks"):
                 url = f"{BASE}/spotify/track/{tid}.html"
@@ -501,8 +530,10 @@ def main() -> None:
                     html = fetch(client, url)
                     entries = parse_track_page(html)
                     save_track_entries(conn, tid, entries)
+                    summary["scraped_tracks"] += 1
                 except Exception as e:
                     tqdm.write(f"  failed {tid}: {e}")
+                    summary["track_errors"] += 1
                 time.sleep(REQUEST_DELAY)
 
             print("\nDone. Sanity check:")
@@ -524,6 +555,41 @@ def main() -> None:
                     (cc,),
                 ).fetchone()
                 print(f"  totals {cc}: {row[0]:,} tracks")
+
+    return summary
+
+
+def main() -> None:
+    load_repo_env(PROJECT_ROOT)
+
+    ap = argparse.ArgumentParser(
+        description="Multi-country kworb.net Spotify chart scraper."
+    )
+    ap.add_argument(
+        "--country", nargs="+", default=DEFAULT_COUNTRIES,
+        metavar="CC",
+        help=f"ISO-2 country codes to scrape "
+             f"(default: {' '.join(DEFAULT_COUNTRIES)})",
+    )
+    ap.add_argument("--debug", action="store_true",
+                    help="dump totals_*_debug.html for each country and print "
+                         "table diagnostics, then exit before track scraping")
+    ap.add_argument("--limit", type=int, default=None,
+                    help="only scrape the first N candidate tracks (smoke test)")
+    ap.add_argument("--max-age-days", type=int, default=FRESHNESS_DAYS,
+                    help=f"skip tracks scraped within this many days "
+                         f"(default: {FRESHNESS_DAYS})")
+    ap.add_argument("--force", action="store_true",
+                    help="re-scrape every track regardless of cache age")
+    args = ap.parse_args()
+
+    run(
+        countries=args.country,
+        max_age_days=args.max_age_days,
+        force=args.force,
+        limit=args.limit,
+        debug=args.debug,
+    )
 
 
 if __name__ == "__main__":

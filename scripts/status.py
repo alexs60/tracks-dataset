@@ -112,10 +112,20 @@ def main() -> None:
             """,
         )
 
+        stage0 = stage0_summary(conn)
         per_country = per_country_breakdown(conn)
 
     pct = (fully_enriched / total * 100.0) if total else 0.0
     print(f"Tracks total:                  {total:,}")
+    if stage0 is not None:
+        n_countries, latest_week, last_scraped = stage0
+        latest_week_str = latest_week or "—"
+        last_scraped_str = last_scraped or "—"
+        print(
+            "Stage 0 (Scraper):             "
+            f"{n_countries:,} countries | latest chart week: {latest_week_str} | "
+            f"last track scrape: {last_scraped_str}"
+        )
     print(
         "Stage 1 (Spotify preview):     "
         f"{stage1_ok:,} ok | {stage1_no_preview:,} no_preview | "
@@ -157,6 +167,29 @@ def main() -> None:
             print(
                 f"  {cc:<8} {n_tracks:>8,} {s1:>10,} {s2:>10,} {s3:>10,}"
             )
+
+
+def stage0_summary(conn) -> tuple[int, str | None, str | None] | None:
+    """Returns (n_countries, latest_chart_week, latest_track_scrape) or None
+    if track_country_totals doesn't exist yet. Both timestamps are best-effort
+    strings — the scraper writes ISO 8601 — and may be None on a fresh DB."""
+    try:
+        n_countries = int(conn.execute(
+            "SELECT COUNT(DISTINCT country) FROM track_country_totals"
+        ).fetchone()[0])
+    except Exception:
+        return None
+    latest_week = conn.execute(
+        "SELECT MAX(week_date) FROM chart_entries"
+    ).fetchone()[0]
+    latest_scrape = conn.execute(
+        "SELECT MAX(last_scraped) FROM tracks"
+    ).fetchone()[0]
+    return (
+        n_countries,
+        str(latest_week) if latest_week else None,
+        str(latest_scrape) if latest_scrape else None,
+    )
 
 
 def per_country_breakdown(conn) -> list[tuple]:

@@ -76,18 +76,26 @@ WORKER_RATE_LIMIT_QPS=1
 
 ---
 
-## Part 1 — Scraper: populate chart data
+## Part 1 — Scraper (Stage 0): populate chart data
 
 The scraper (`scraper/kworb_scraper.py`) fetches weekly chart data from kworb.net.
 It writes to **either** SQLite (`DB_PATH`) **or** PostgreSQL (`DATABASE_URL`) —
 the same env vars the enrichment pipeline uses, so you can scrape directly into
 the production Postgres DB and skip pgloader entirely.
 
-It supports multiple countries on a single invocation. Default country set:
-`IT ES FR DE GB US PT NL`. Each `{cc}_weekly_totals.html` discovers tracks; then
-each track's per-track page (`/spotify/track/{id}.html`) is fetched once — that
-page contains weekly chart entries for *all* countries kworb tracks, not just
-the discovery country.
+It supports multiple countries on a single invocation. Default country set
+covers Western Europe, Iberia, Mediterranean, Nordics/Scandinavia, Baltics,
+Central/Eastern Europe, Russia, and the United States (~27 countries). Each
+`{cc}_weekly_totals.html` discovers tracks; then each track's per-track page
+(`/spotify/track/{id}.html`) is fetched once — that page contains weekly chart
+entries for *all* countries kworb tracks, not just the discovery country.
+
+The scraper can be run **either**:
+- Manually as a one-off (the typical workflow), **or**
+- Automatically as **Stage 0** of the pipeline, before the enrichment loop —
+  see [Part 4.1](#part-41--stage-0-pipeline-integrated-scraping-optional) below.
+  Default is OFF (`PIPELINE_RUN_SCRAPER=false`) so the docker container does
+  not re-scrape on every restart.
 
 ```bash
 # Default: scrape all 8 countries into whatever DB env points at
@@ -356,6 +364,43 @@ python workers/run_pipeline.py --batch-size 10 --interval 60
 |------|-------------|
 | `--batch-size` | Tracks to claim per stage per pass (default: `10`) |
 | `--interval` | Seconds to sleep between passes (default: `60`) |
+| `--run-scraper` | Run the kworb scraper once at startup as Stage 0, before the loop (default: off; env: `PIPELINE_RUN_SCRAPER`) |
+| `--scraper-max-age-days` | Track-page cache window for Stage 0 (default `90`; env: `SCRAPER_MAX_AGE_DAYS`) |
+| `--scraper-force` | Stage 0 ignores the cache and re-scrapes every track (default off; env: `SCRAPER_FORCE`) |
+
+### Stage 0: pipeline-integrated scraping (opt-in)
+
+Stage 0 is the kworb scrape, run **once** at pipeline startup before any
+enrichment stage. It is OFF by default — the scraper is normally an operator
+task (`python scraper/kworb_scraper.py`). Enable it when you want the pipeline
+container to also keep chart data fresh:
+
+```bash
+# Local
+python workers/run_pipeline.py --run-scraper
+
+# Docker — set PIPELINE_RUN_SCRAPER=true in .env, then:
+docker compose up -d --build
+```
+
+Behavior:
+- Runs once per process startup (until completion), then enters the enrichment
+  loop. It does **not** repeat on every loop pass — kworb refreshes weekly.
+- Caching applies (`--scraper-max-age-days`, default 90 days), so a container
+  restart re-runs it cheaply: totals pages re-fetch, track pages skipped if
+  fresh.
+- Failures (network, parse) are logged to `logs/pipeline.log` as
+  `event=stage0_error` but never crash the loop.
+- Country list defaults to ~27 countries (Europe + Russia + USA + Scandinavia).
+  Override with `SCRAPER_COUNTRIES` (whitespace-separated ISO-2 codes).
+
+Logged events:
+
+| Event | When |
+|---|---|
+| `stage0_start` | Stage 0 begins |
+| `stage0_done` | Stage 0 finished — payload includes `discovered_tracks`, `scraped_tracks`, `track_errors`, `country_errors`, `skipped_fresh`, `skipped_dormant` |
+| `stage0_error` | Stage 0 raised before completing |
 
 ### Option B — Individual stages
 

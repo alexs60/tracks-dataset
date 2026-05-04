@@ -112,6 +112,8 @@ def main() -> None:
             """,
         )
 
+        per_country = per_country_breakdown(conn)
+
     pct = (fully_enriched / total * 100.0) if total else 0.0
     print(f"Tracks total:                  {total:,}")
     print(
@@ -142,6 +144,48 @@ def main() -> None:
         f"{stage3_ok:,} ok | {stage3_failed:,} failed | {stage3_pending:,} pending"
     )
     print(f"Fully enriched:                {fully_enriched:,} ({pct:.1f}%)")
+
+    if per_country:
+        print()
+        print("Per-country breakdown (from track_country_totals):")
+        print(
+            f"  {'country':<8} {'tracks':>8} {'stage1_ok':>10} "
+            f"{'stage2_ok':>10} {'stage3_ok':>10}"
+        )
+        for row in per_country:
+            cc, n_tracks, s1, s2, s3 = row
+            print(
+                f"  {cc:<8} {n_tracks:>8,} {s1:>10,} {s2:>10,} {s3:>10,}"
+            )
+
+
+def per_country_breakdown(conn) -> list[tuple]:
+    """Returns [(country, n_tracks, stage1_ok, stage2_ok, stage3_ok), ...]
+    or [] if track_country_totals doesn't exist yet."""
+    try:
+        rows = conn.execute("""
+            SELECT
+                tct.country,
+                COUNT(DISTINCT tct.track_id) AS n_tracks,
+                COUNT(DISTINCT CASE WHEN t.preview_status = 'ok'
+                                    THEN tct.track_id END) AS s1_ok,
+                COUNT(DISTINCT CASE WHEN rb.status = 'ok'
+                                    THEN tct.track_id END) AS s2_ok,
+                COUNT(DISTINCT CASE WHEN a.status = 'ok'
+                                    THEN tct.track_id END) AS s3_ok
+            FROM track_country_totals tct
+            JOIN tracks t                ON t.track_id = tct.track_id
+            LEFT JOIN track_reccobeats rb ON rb.track_id = tct.track_id
+            LEFT JOIN track_analysis a    ON a.track_id = tct.track_id
+            GROUP BY tct.country
+            ORDER BY tct.country
+        """).fetchall()
+    except Exception:
+        return []
+    return [
+        (str(r[0]), int(r[1]), int(r[2] or 0), int(r[3] or 0), int(r[4] or 0))
+        for r in rows
+    ]
 
 
 if __name__ == "__main__":

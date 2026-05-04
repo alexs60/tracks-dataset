@@ -13,7 +13,7 @@ Step-by-step guide for operating the `tracks-dataset` pipeline from scratch thro
 ### Python dependencies
 
 ```bash
-pip install httpx psycopg2-binary
+pip install -r requirements.txt
 ```
 
 Or if you use the venv:
@@ -21,8 +21,11 @@ Or if you use the venv:
 ```bash
 python -m venv venv
 source venv/bin/activate
-pip install httpx psycopg2-binary
+pip install -r requirements.txt
 ```
+
+`requirements.txt` covers both the enrichment pipeline (`httpx`,
+`psycopg2-binary`) and the kworb scraper (`selectolax`, `tenacity`, `tqdm`).
 
 ---
 
@@ -75,28 +78,75 @@ WORKER_RATE_LIMIT_QPS=1
 
 ## Part 1 — Scraper: populate chart data
 
-The scraper fetches weekly chart data from kworb.net and writes it into `kworb_italy.db`.
+The scraper (`scraper/kworb_scraper.py`) fetches weekly chart data from kworb.net.
+It writes to **either** SQLite (`DB_PATH`) **or** PostgreSQL (`DATABASE_URL`) —
+the same env vars the enrichment pipeline uses, so you can scrape directly into
+the production Postgres DB and skip pgloader entirely.
+
+It supports multiple countries on a single invocation. Default country set:
+`IT ES FR DE GB US PT NL`. Each `{cc}_weekly_totals.html` discovers tracks; then
+each track's per-track page (`/spotify/track/{id}.html`) is fetched once — that
+page contains weekly chart entries for *all* countries kworb tracks, not just
+the discovery country.
 
 ```bash
-# Normal run — skip tracks scraped within the last 90 days
-python scraper/kworb_italy_scraper.py
+# Default: scrape all 8 countries into whatever DB env points at
+python scraper/kworb_scraper.py
+
+# Single country
+python scraper/kworb_scraper.py --country IT
+
+# Custom country list
+python scraper/kworb_scraper.py --country IT GB FR DE ES US PT NL
 
 # Shorter cache window (re-scrape more often)
-python scraper/kworb_italy_scraper.py --max-age-days 30
+python scraper/kworb_scraper.py --max-age-days 30
 
 # Force a full re-scrape of all tracks
-python scraper/kworb_italy_scraper.py --force
+python scraper/kworb_scraper.py --force
 
-# Smoke test (5 tracks only)
-python scraper/kworb_italy_scraper.py --limit 5 --force
+# Smoke test
+python scraper/kworb_scraper.py --country IT --limit 5 --force
+
+# Inspect a country's totals page layout (writes totals_<cc>_debug.html, exits)
+python scraper/kworb_scraper.py --country GB --debug
 ```
 
-Output: `kworb_italy.db` containing `tracks` and `chart_entries` tables.
+Tables written:
+- `tracks` — core identification (`track_id`, `title`, `artist`, `artist_id`,
+  `last_scraped`). Legacy IT-specific cols (`weeks_on_it`, `peak_it`,
+  `last_chart_week`, `total_streams`) are still updated when scraping IT, so
+  existing exports keep working.
+- `chart_entries` — per-week, per-country chart positions and stream counts.
+- `track_country_totals` — per-country summary
+  (`weeks_on`, `peak`, `total_streams`, `last_chart_week`, `last_seen`),
+  PK `(track_id, country)`.
 
-> **Do not use `kworb_italy.db` as the enrichment target.** Copy it first:
-> ```bash
-> cp kworb_italy.db /tmp/kworb_italy.db
-> ```
+The scraper bootstraps these tables idempotently on first run, so it works
+against an empty DB. For an existing Postgres DB, `track_country_totals` is
+also created by migration `003_track_country_totals.pg.sql` if you prefer to
+manage schema centrally with `scripts/run_migrations.py`.
+
+### Direct-to-Postgres scraping (recommended)
+
+Set `DATABASE_URL` in `.env` (same value the pipeline uses) and run:
+
+```bash
+python scraper/kworb_scraper.py
+```
+
+No SQLite copy, no pgloader, no risk of `include drop` wiping enrichment data.
+
+### SQLite scraping (legacy / development)
+
+Unset `DATABASE_URL` (or leave it blank) and set `DB_PATH`:
+
+```bash
+DB_PATH=/tmp/kworb_charts.db python scraper/kworb_scraper.py
+```
+
+> The old `scraper/kworb_italy_scraper.py` (SQLite-only, IT-only) is kept for
+> reference but is no longer the recommended entrypoint.
 
 ---
 
@@ -662,52 +712,51 @@ Postgres connections from this script are opened in **read-only** mode, so the e
 ### With Postgres + Docker (production)
 
 ```bash
-# 1. Scrape latest chart data into kworb_italy.db
-python scraper/kworb_italy_scraper.py
-
-# 2. Seed Postgres with tracks and chart_entries (edit migrate.load credentials first)
-pgloader migrate.load
-
-# 3. Apply audio feature schema to Postgres
+# 1. Apply enrichment + chart-data schema to Postgres
 python scripts/run_migrations.py
 
-# 4. Check initial status
+# 2. Scrape latest chart data DIRECTLY into Postgres (DATABASE_URL from .env)
+python scraper/kworb_scraper.py
+
+# 3. Check initial status
 python scripts/status.py
 
-# 5. Build and start the pipeline container
+# 4. Build and start the pipeline container
 docker compose up -d --build
 
-# 6. Follow logs
+# 5. Follow logs
 docker compose logs -f pipeline
 
-# 7. Periodically check coverage in another terminal
+# 6. Periodically check coverage in another terminal
 python scripts/status.py
 
-# 8. (optional) Once Stage 2 has settled, fill the gaps from an external CSV.
+# 7. (optional) Once Stage 2 has settled, fill the gaps from an external CSV.
 #    See Part 4.1 for details.
 python scripts/load_external_features.py --csv ~/kaggle/dataset.csv --source kaggle_maharshipandya
 python scripts/fill_external_features.py --source kaggle_maharshipandya
 ```
 
+> The legacy pgloader path (Part 3.2) is no longer required: the scraper now
+> writes directly to Postgres and bootstraps the chart-data tables itself, so
+> `pgloader` would only overwrite enrichment data with `include drop`. Keep
+> `migrate.load` only if you need a one-shot SQLite → Postgres seed.
+
 ### With SQLite (development / local)
 
 ```bash
-# 1. Scrape
-python scraper/kworb_italy_scraper.py
-
-# 2. Copy live DB to a safe enrichment target
-cp kworb_italy.db /tmp/kworb_italy.db
-
-# 3. Apply migrations (DB_PATH must be set in .env)
+# 1. Apply migrations (DB_PATH in .env, DATABASE_URL unset)
 python scripts/run_migrations.py
 
-# 4. Run the pipeline
+# 2. Scrape
+python scraper/kworb_scraper.py
+
+# 3. Run the pipeline
 python workers/run_pipeline.py --batch-size 50 --interval 30
 
-# 5. Monitor
+# 4. Monitor
 python scripts/status.py
 
-# 6. (optional) Fill remaining gaps from an external CSV. See Part 4.1.
+# 5. (optional) Fill remaining gaps from an external CSV. See Part 4.1.
 python scripts/load_external_features.py --csv ~/kaggle/dataset.csv --source kaggle_maharshipandya
 python scripts/fill_external_features.py --source kaggle_maharshipandya
 ```

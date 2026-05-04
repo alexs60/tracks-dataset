@@ -1,2 +1,5 @@
 httpx
 psycopg2-binary
+selectolax
+tenacity
+tqdm

@@ -80,9 +80,17 @@ TRACK_COLS = [
     ("t", "title",         "title"),
     ("t", "artist",        "artist"),
     ("t", "artist_id",     "artist_id"),
-    ("t", "total_streams", "total_streams"),
-    ("t", "weeks_on_it",   "weeks_on_it"),
-    ("t", "peak_it",       "peak_it"),
+]
+
+# Per-country chart summary, joined on (track_id, country) of the chart entry
+# so each row gets the totals for the country it appeared in. NULL for chart
+# entries from countries not present in track_country_totals (e.g. countries
+# that surfaced via a track-page scrape but were never explicitly discovered
+# via {cc}_weekly_totals).
+COUNTRY_TOTALS_COLS = [
+    ("tct", "weeks_on",      "weeks_on_chart"),
+    ("tct", "peak",          "peak_position"),
+    ("tct", "total_streams", "total_streams_country"),
 ]
 
 # Reccobeats-only metadata. duration_ms isn't an audio scalar — only Reccobeats
@@ -153,7 +161,10 @@ def build_select_sql(args: argparse.Namespace) -> tuple[str, list[str]]:
     select_parts: list[str] = []
     header: list[str] = []
 
-    for tbl, col, alias in CHART_COLS + TRACK_COLS + RECCOBEATS_COLS + AUDIO_FEATURE_COLS + ANALYSIS_COLS:
+    for tbl, col, alias in (
+        CHART_COLS + TRACK_COLS + COUNTRY_TOTALS_COLS
+        + RECCOBEATS_COLS + AUDIO_FEATURE_COLS + ANALYSIS_COLS
+    ):
         select_parts.append(f"{tbl}.{col} AS {alias}")
         header.append(alias)
 
@@ -189,7 +200,9 @@ def build_select_sql(args: argparse.Namespace) -> tuple[str, list[str]]:
     if args.since:
         where.append("ce.week_date >= ?")
     if args.min_streams is not None:
-        where.append("t.total_streams >= ?")
+        # Per-country threshold against the country totals row that matches
+        # ce.country. Tracks from countries with no totals row are excluded.
+        where.append("tct.total_streams >= ?")
     where_sql = "WHERE " + " AND ".join(where)
 
     # Postgres requires every non-aggregated select column to appear in
@@ -197,7 +210,10 @@ def build_select_sql(args: argparse.Namespace) -> tuple[str, list[str]]:
     # on both backends.
     group_by_parts = [
         f"{tbl}.{col}"
-        for tbl, col, _ in CHART_COLS + TRACK_COLS + RECCOBEATS_COLS + AUDIO_FEATURE_COLS + ANALYSIS_COLS
+        for tbl, col, _ in (
+            CHART_COLS + TRACK_COLS + COUNTRY_TOTALS_COLS
+            + RECCOBEATS_COLS + AUDIO_FEATURE_COLS + ANALYSIS_COLS
+        )
     ]
     group_by_sql = ", ".join(group_by_parts)
 
@@ -205,6 +221,8 @@ def build_select_sql(args: argparse.Namespace) -> tuple[str, list[str]]:
         SELECT {select_sql}
         FROM chart_entries ce
         JOIN tracks t                                 ON t.track_id   = ce.track_id
+        LEFT JOIN track_country_totals tct            ON tct.track_id = ce.track_id
+                                                     AND tct.country  = ce.country
         LEFT JOIN track_reccobeats rb                 ON rb.track_id  = ce.track_id
         LEFT JOIN v_track_audio_features_merged vam   ON vam.track_id = ce.track_id
         LEFT JOIN track_analysis a                    ON a.track_id   = ce.track_id
@@ -367,7 +385,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--since", type=str, default=None,
                    help="Filter chart_entries.week_date >= ISO date (YYYY-MM-DD).")
     p.add_argument("--min-streams", type=int, default=None,
-                   help="Filter tracks.total_streams >= N.")
+                   help="Filter track_country_totals.total_streams >= N for "
+                        "the export's country (excludes tracks with no totals "
+                        "row for that country).")
 
     return p.parse_args()
 

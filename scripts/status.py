@@ -19,6 +19,25 @@ def scalar(conn, query: str) -> int:
     return int(conn.execute(query).fetchone()[0])
 
 
+def _recent_5m_threshold() -> str:
+    return (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat(timespec="seconds")
+
+
+def _recent(conn, sql: str, threshold: str) -> int:
+    return int(conn.execute(sql, (threshold,)).fetchone()[0])
+
+
+def _eta_suffix(pending: int, recent_5m: int) -> str:
+    """Returns ' | rate X t/s | eta Y' (or ' | done' / ' | idle')."""
+    if pending <= 0:
+        return " | done"
+    if recent_5m <= 0:
+        return " | idle"
+    rate = recent_5m / 300.0
+    eta_h = pending / rate / 3600.0
+    return f" | rate {rate:.2f} t/s | eta {eta_h:.1f}h"
+
+
 def main() -> None:
     with connect() as conn:
         total = scalar(conn, "SELECT COUNT(*) FROM tracks")
@@ -113,6 +132,34 @@ def main() -> None:
             """,
         )
 
+        threshold = _recent_5m_threshold()
+        stage1_recent = _recent(
+            conn,
+            "SELECT COUNT(*) FROM tracks WHERE preview_fetched >= ?",
+            threshold,
+        )
+        stage2_recent = _recent(
+            conn,
+            "SELECT COUNT(*) FROM track_reccobeats WHERE fetched_at >= ?",
+            threshold,
+        )
+        fallback_recent = _recent(
+            conn,
+            "SELECT COUNT(*) FROM track_audio_features_external WHERE fetched_at >= ?",
+            threshold,
+        )
+        stage2_2_recent = _recent(
+            conn,
+            "SELECT COUNT(*) FROM track_audio_features_external "
+            "WHERE source = 'essentia_derived' AND fetched_at >= ?",
+            threshold,
+        )
+        stage3_recent = _recent(
+            conn,
+            "SELECT COUNT(*) FROM track_analysis WHERE analyzed_at >= ?",
+            threshold,
+        )
+
         stage0 = stage0_summary(conn)
         per_country = per_country_breakdown(conn)
 
@@ -151,12 +198,14 @@ def main() -> None:
         "Stage 1 (Spotify preview):     "
         f"{stage1_ok:,} ok | {stage1_no_preview:,} no_preview | "
         f"{stage1_failed:,} failed | {stage1_pending:,} pending"
+        f"{_eta_suffix(stage1_pending, stage1_recent)}"
     )
     print(
         "Stage 2 (Reccobeats):          "
         f"{stage2_ok:,} ok | {stage2_not_found:,} not_found | "
         f"{stage2_no_features:,} no_features | {stage2_failed:,} failed | "
         f"{stage2_pending:,} pending"
+        f"{_eta_suffix(stage2_pending, stage2_recent)}"
     )
     sources_suffix = (
         f" ({', '.join(f'{src}={n:,}' for src, n in fallback_sources)})"
@@ -164,15 +213,19 @@ def main() -> None:
     )
     print(
         "Stage 2.1+2.2 (Fallback fill): "
-        f"{fallback_filled:,} filled | {fallback_pending:,} pending{sources_suffix}"
+        f"{fallback_filled:,} filled | {fallback_pending:,} pending"
+        f"{_eta_suffix(fallback_pending, fallback_recent)}"
+        f"{sources_suffix}"
     )
     print(
         "Stage 2.2 (Essentia derived):  "
         f"{stage2_2_filled:,} filled | {stage2_2_awaiting_stage3:,} awaiting Stage 3"
+        f"{_eta_suffix(stage2_2_awaiting_stage3, stage2_2_recent)}"
     )
     print(
         "Stage 3 (Essentia):            "
         f"{stage3_ok:,} ok | {stage3_failed:,} failed | {stage3_pending:,} pending"
+        f"{_eta_suffix(stage3_pending, stage3_recent)}"
     )
     print(f"Fully enriched:                {fully_enriched:,} ({pct:.1f}%)")
 

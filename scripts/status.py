@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -118,12 +119,32 @@ def main() -> None:
     pct = (fully_enriched / total * 100.0) if total else 0.0
     print(f"Tracks total:                  {total:,}")
     if stage0 is not None:
-        n_countries, latest_week, last_scraped = stage0
-        latest_week_str = latest_week or "—"
-        last_scraped_str = last_scraped or "—"
+        latest_week_str = stage0["latest_week"] or "—"
+        last_scraped_str = stage0["latest_scrape"] or "—"
+        scraped_pct = (
+            stage0["scraped"] / stage0["total"] * 100.0
+            if stage0["total"] else 0.0
+        )
+        if stage0["rate_per_sec"] > 0:
+            rate_str = f"{stage0['rate_per_sec']:.2f} t/s"
+            eta_str = (
+                f"{stage0['eta_hours']:.1f}h"
+                if stage0["eta_hours"] is not None else "—"
+            )
+        else:
+            rate_str = "idle"
+            eta_str = "—"
         print(
             "Stage 0 (Scraper):             "
-            f"{n_countries:,} countries | latest chart week: {latest_week_str} | "
+            f"{stage0['n_countries']:,} countries | "
+            f"{stage0['scraped']:,}/{stage0['total']:,} scraped "
+            f"({scraped_pct:.1f}%) | "
+            f"rate {rate_str} (last 5m: {stage0['recent_5min']:,}) | "
+            f"eta {eta_str}"
+        )
+        print(
+            "                               "
+            f"latest chart week: {latest_week_str} | "
             f"last track scrape: {last_scraped_str}"
         )
     print(
@@ -169,10 +190,11 @@ def main() -> None:
             )
 
 
-def stage0_summary(conn) -> tuple[int, str | None, str | None] | None:
-    """Returns (n_countries, latest_chart_week, latest_track_scrape) or None
-    if track_country_totals doesn't exist yet. Both timestamps are best-effort
-    strings — the scraper writes ISO 8601 — and may be None on a fresh DB."""
+def stage0_summary(conn) -> dict | None:
+    """Returns a dict with Stage 0 progress fields, or None if
+    track_country_totals doesn't exist yet. Timestamps are ISO 8601 strings
+    written by the scraper. The 5-minute window approximates current scrape
+    rate; rate_per_sec is 0.0 when the scraper is idle/finished."""
     try:
         n_countries = int(conn.execute(
             "SELECT COUNT(DISTINCT country) FROM track_country_totals"
@@ -185,11 +207,34 @@ def stage0_summary(conn) -> tuple[int, str | None, str | None] | None:
     latest_scrape = conn.execute(
         "SELECT MAX(last_scraped) FROM tracks"
     ).fetchone()[0]
-    return (
-        n_countries,
-        str(latest_week) if latest_week else None,
-        str(latest_scrape) if latest_scrape else None,
-    )
+    total = int(conn.execute("SELECT COUNT(*) FROM tracks").fetchone()[0])
+    scraped = int(conn.execute(
+        "SELECT COUNT(*) FROM tracks WHERE last_scraped IS NOT NULL"
+    ).fetchone()[0])
+    pending = max(total - scraped, 0)
+
+    window_minutes = 5
+    threshold = (
+        datetime.now(timezone.utc) - timedelta(minutes=window_minutes)
+    ).isoformat(timespec="seconds")
+    recent = int(conn.execute(
+        "SELECT COUNT(*) FROM tracks WHERE last_scraped >= ?",
+        (threshold,),
+    ).fetchone()[0])
+    rate_per_sec = recent / (window_minutes * 60.0) if recent > 0 else 0.0
+    eta_hours = (pending / rate_per_sec / 3600.0) if rate_per_sec > 0 else None
+
+    return {
+        "n_countries": n_countries,
+        "latest_week": str(latest_week) if latest_week else None,
+        "latest_scrape": str(latest_scrape) if latest_scrape else None,
+        "total": total,
+        "scraped": scraped,
+        "pending": pending,
+        "recent_5min": recent,
+        "rate_per_sec": rate_per_sec,
+        "eta_hours": eta_hours,
+    }
 
 
 def per_country_breakdown(conn) -> list[tuple]:

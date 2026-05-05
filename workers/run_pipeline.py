@@ -32,8 +32,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--batch-size", type=int,
                         default=int(os.environ.get("WORKER_BATCH_SIZE", "10")))
-    parser.add_argument("--interval", type=int, default=60,
-                        help="Seconds to sleep between passes (default: 60)")
+    parser.add_argument("--interval", type=int, default=15,
+                        help="Seconds to sleep between passes (default: 15). "
+                             "Per-stage qps caps already throttle the work, "
+                             "so this only governs idle time when a stage "
+                             "has nothing to do.")
     parser.add_argument(
         "--run-scraper", action="store_true",
         default=_env_truthy("PIPELINE_RUN_SCRAPER"),

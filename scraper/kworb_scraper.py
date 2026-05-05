@@ -52,8 +52,8 @@ from workers.lib.db import DbAdapter, connect
 from workers.lib.env import load_repo_env
 
 BASE = "https://kworb.net"
-USER_AGENT = "kworb-scraper/3.0 (personal research)"
-REQUEST_DELAY = 1.0
+USER_AGENT = "kworb-scraper/3.0 (personal research) - contact: alex.fg.93@gmail.com"
+REQUEST_DELAY = 0.3
 FRESHNESS_DAYS = 90
 DORMANT_DAYS = 60
 

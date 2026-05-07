@@ -34,11 +34,12 @@ def _env_truthy(name: str) -> bool:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Run all enrichment stages, looping forever. "
-                    "Stage 1+2 run in the main thread; Stage 3 (and gated "
-                    "Stage 2.2) run in a background thread so Essentia "
-                    "analysis cannot throttle Spotify preview fetching. "
-                    "Stage 2.2 runs only when Stage 2 (Reccobeats) has no "
+        description="Run all enrichment stages, looping forever. Each "
+                    "stage runs in its own thread so the slowest never "
+                    "throttles a faster one: Stage 1 (Spotify previews) "
+                    "in the main thread, Stage 2 (Reccobeats) and Stage 3 "
+                    "(Essentia, plus gated Stage 2.2) each in a background "
+                    "thread. Stage 2.2 runs only when Stage 2 has no "
                     "pending tracks left, leaving room for the operator-run "
                     "Stage 2.1 Kaggle fallback to land first. Optionally "
                     "runs the kworb scraper once at startup as Stage 0."
@@ -124,14 +125,30 @@ def run_stage0(pipeline_logger, *, max_age_days: int, force: bool) -> None:
         log_event(pipeline_logger, event="stage0_error", error=str(exc))
 
 
-def main_loop(args, logger1, logger2, pipeline_logger) -> None:
-    """Stage 1 + Stage 2. Independent of Stage 3 throughput."""
+def main_loop(args, logger1, pipeline_logger) -> None:
+    """Stage 1 only. Runs in the main thread because signal handlers are
+    delivered here; Stage 2 and Stage 3 run in their own threads so they
+    are not paced by Stage 1's per-request latency."""
     while not _shutdown.is_set():
         n1 = s1.process_once(args.batch_size, logger1)
-        n2 = s2.process_once(args.batch_size, logger2)
-        log_event(pipeline_logger, event="pass_main", n1=n1, n2=n2)
+        log_event(pipeline_logger, event="pass_s1", n1=n1)
         if _shutdown.wait(args.interval):
             return
+
+
+def stage2_loop(args, logger2, pipeline_logger) -> None:
+    """Stage 2 (Reccobeats) on its own thread so it can run at the full
+    5 qps cap independent of Stage 1's pace."""
+    try:
+        while not _shutdown.is_set():
+            n2 = s2.process_once(args.batch_size, logger2)
+            log_event(pipeline_logger, event="pass_s2", n2=n2)
+            if _shutdown.wait(args.interval):
+                return
+    except Exception as exc:
+        log_event(pipeline_logger, event="s2_thread_crashed", error=str(exc))
+        _shutdown.set()
+        raise
 
 
 def stage3_loop(args, logger3, logger2_2, pipeline_logger) -> None:
@@ -185,21 +202,29 @@ def main() -> None:
     signal.signal(signal.SIGTERM, _on_signal)
     signal.signal(signal.SIGINT, _on_signal)
 
-    bg = threading.Thread(
+    bg2 = threading.Thread(
+        target=stage2_loop,
+        args=(args, logger2, pipeline_logger),
+        name="stage2-bg",
+        daemon=True,
+    )
+    bg3 = threading.Thread(
         target=stage3_loop,
         args=(args, logger3, logger2_2, pipeline_logger),
         name="stage3-bg",
         daemon=True,
     )
-    bg.start()
+    bg2.start()
+    bg3.start()
 
     try:
-        main_loop(args, logger1, logger2, pipeline_logger)
+        main_loop(args, logger1, pipeline_logger)
     finally:
         _shutdown.set()
-        # Daemon thread will be killed on process exit; we still try to
+        # Daemon threads will be killed on process exit; we still try to
         # join briefly so an in-flight track has a chance to commit.
-        bg.join(timeout=300.0)
+        bg2.join(timeout=60.0)
+        bg3.join(timeout=300.0)
         log_event(pipeline_logger, event="shutdown_done")
 
 

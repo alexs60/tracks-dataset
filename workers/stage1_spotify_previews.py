@@ -4,6 +4,7 @@ import argparse
 import os
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import httpx
@@ -44,52 +45,70 @@ def claim_batch(conn, batch_size: int) -> list[str]:
     return [row[0] for row in rows]
 
 
-def process_once(batch_size: int, logger) -> int:
-    qps = float(os.environ.get("STAGE1_RATE_LIMIT_QPS", os.environ.get("WORKER_RATE_LIMIT_QPS", "1")))
-    limiter = SimpleRateLimiter(qps=qps)
+def _process_track(track_id: str, limiter: SimpleRateLimiter, logger) -> None:
+    """Fetch the Spotify embed preview for one track and persist the result.
+    Opens its own DB connection and httpx client so it is safe to run from
+    a thread pool. The shared `limiter` enforces the global qps cap across
+    all workers."""
+    started = time.monotonic()
+    log_event(logger, ts=utc_now_iso(), stage=1, track_id=track_id, event="started")
     client = httpx.Client(headers={"User-Agent": get_embed_user_agent()}, timeout=30.0)
-
     try:
         with connect() as conn:
-            batch = claim_batch(conn, batch_size)
-            if not batch:
-                return 0
+            limiter.wait()
+            result = fetch_preview(client, track_id)
+            fetched_at = utc_now_iso()
+            dump_path = None
+            if result.status in {"failed", "no_preview"}:
+                dump_path = maybe_dump_html(track_id, result.html)
 
-            for track_id in batch:
-                started = time.monotonic()
-                log_event(logger, ts=utc_now_iso(), stage=1, track_id=track_id, event="started")
-                limiter.wait()
-                result = fetch_preview(client, track_id)
-                fetched_at = utc_now_iso()
-                dump_path = None
-                if result.status in {"failed", "no_preview"}:
-                    dump_path = maybe_dump_html(track_id, result.html)
+            with transaction(conn):
+                conn.execute(
+                    """
+                    UPDATE tracks
+                    SET preview_url = ?, preview_fetched = ?, preview_status = ?
+                    WHERE track_id = ?
+                    """,
+                    (result.preview_url, fetched_at, result.status, track_id),
+                )
 
-                with transaction(conn):
-                    conn.execute(
-                        """
-                        UPDATE tracks
-                        SET preview_url = ?, preview_fetched = ?, preview_status = ?
-                        WHERE track_id = ?
-                        """,
-                        (result.preview_url, fetched_at, result.status, track_id),
-                    )
-
-                duration_ms = round((time.monotonic() - started) * 1000)
-                payload = {
-                    "ts": fetched_at,
-                    "stage": 1,
-                    "track_id": track_id,
-                    "event": "ok" if result.status in {"ok", "no_preview"} else "failed",
-                    "duration_ms": duration_ms,
-                    "error": result.error,
-                }
-                if dump_path is not None:
-                    payload["html_dump"] = str(dump_path)
-                log_event(logger, **payload)
-            return len(batch)
+        duration_ms = round((time.monotonic() - started) * 1000)
+        payload = {
+            "ts": fetched_at,
+            "stage": 1,
+            "track_id": track_id,
+            "event": "ok" if result.status in {"ok", "no_preview"} else "failed",
+            "duration_ms": duration_ms,
+            "error": result.error,
+        }
+        if dump_path is not None:
+            payload["html_dump"] = str(dump_path)
+        log_event(logger, **payload)
     finally:
         client.close()
+
+
+def process_once(batch_size: int, logger) -> int:
+    with connect() as conn:
+        batch = claim_batch(conn, batch_size)
+    if not batch:
+        return 0
+
+    qps = float(os.environ.get("STAGE1_RATE_LIMIT_QPS", os.environ.get("WORKER_RATE_LIMIT_QPS", "1")))
+    # Shared limiter enforces the global qps cap across all worker threads.
+    limiter = SimpleRateLimiter(qps=qps)
+    workers = max(1, int(os.environ.get("STAGE1_WORKERS", "1")))
+
+    if workers == 1:
+        for track_id in batch:
+            _process_track(track_id, limiter, logger)
+    else:
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = [pool.submit(_process_track, tid, limiter, logger)
+                       for tid in batch]
+            for fut in futures:
+                fut.result()
+    return len(batch)
 
 
 def main() -> None:

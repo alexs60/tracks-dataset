@@ -7,6 +7,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
@@ -188,49 +189,73 @@ def replace_analysis_rows(conn, parsed) -> None:
         )
 
 
-def process_once(batch_size: int, logger) -> int:
+def _process_track(track_id: str, preview_url: str, logger) -> None:
+    """Analyse one track end-to-end: download preview, call Essentia,
+    write the resulting rows. Opens its own DB connection and httpx
+    client so it is safe to run from a thread pool."""
+    started = time.monotonic()
+    analyzed_at = utc_now_iso()
+    log_event(logger, ts=analyzed_at, stage=3, track_id=track_id, event="started")
     client = httpx.Client(timeout=60.0)
     try:
         with connect() as conn:
-            batch = claim_batch(conn, batch_size)
-            if not batch:
-                return 0
+            try:
+                with tempfile.TemporaryDirectory(prefix=f"essentia_{track_id}_") as tmp_dir:
+                    tmp_path = Path(tmp_dir)
+                    mp3_path = tmp_path / f"{track_id}.mp3"
+                    json_path = tmp_path / f"{track_id}.json"
 
-            for track_id, preview_url in batch:
-                started = time.monotonic()
-                analyzed_at = utc_now_iso()
-                log_event(logger, ts=analyzed_at, stage=3, track_id=track_id, event="started")
-                try:
-                    with tempfile.TemporaryDirectory(prefix=f"essentia_{track_id}_") as tmp_dir:
-                        tmp_path = Path(tmp_dir)
-                        mp3_path = tmp_path / f"{track_id}.mp3"
-                        json_path = tmp_path / f"{track_id}.json"
+                    response = client.get(preview_url, follow_redirects=True)
+                    if response.status_code in {403, 410}:
+                        with transaction(conn):
+                            conn.execute(
+                                "UPDATE tracks SET preview_status = 'failed' WHERE track_id = ?",
+                                (track_id,),
+                            )
+                        raise RuntimeError(f"preview url expired with status {response.status_code}")
+                    response.raise_for_status()
+                    mp3_path.write_bytes(response.content)
 
-                        response = client.get(preview_url, follow_redirects=True)
-                        if response.status_code in {403, 410}:
-                            with transaction(conn):
-                                conn.execute(
-                                    "UPDATE tracks SET preview_status = 'failed' WHERE track_id = ?",
-                                    (track_id,),
-                                )
-                            raise RuntimeError(f"preview url expired with status {response.status_code}")
-                        response.raise_for_status()
-                        mp3_path.write_bytes(response.content)
+                    if essentia_api_url():
+                        payload = analyze_with_remote_api(client, mp3_path)
+                    else:
+                        payload = analyze_with_local_extractor(mp3_path, json_path)
+                    parsed = parse_essentia_json(track_id, payload, analyzed_at)
+                    replace_analysis_rows(conn, parsed)
 
-                        if essentia_api_url():
-                            payload = analyze_with_remote_api(client, mp3_path)
-                        else:
-                            payload = analyze_with_local_extractor(mp3_path, json_path)
-                        parsed = parse_essentia_json(track_id, payload, analyzed_at)
-                        replace_analysis_rows(conn, parsed)
-
-                    log_event(logger, ts=utc_now_iso(), stage=3, track_id=track_id, event="ok", duration_ms=round((time.monotonic() - started) * 1000), error=None)
-                except Exception as exc:
-                    mark_analysis_failure(conn, track_id, str(exc), analyzed_at)
-                    log_event(logger, ts=utc_now_iso(), stage=3, track_id=track_id, event="failed", duration_ms=round((time.monotonic() - started) * 1000), error=str(exc))
-            return len(batch)
+                log_event(logger, ts=utc_now_iso(), stage=3, track_id=track_id,
+                          event="ok",
+                          duration_ms=round((time.monotonic() - started) * 1000),
+                          error=None)
+            except Exception as exc:
+                mark_analysis_failure(conn, track_id, str(exc), analyzed_at)
+                log_event(logger, ts=utc_now_iso(), stage=3, track_id=track_id,
+                          event="failed",
+                          duration_ms=round((time.monotonic() - started) * 1000),
+                          error=str(exc))
     finally:
         client.close()
+
+
+def process_once(batch_size: int, logger) -> int:
+    with connect() as conn:
+        batch = claim_batch(conn, batch_size)
+    if not batch:
+        return 0
+
+    workers = max(1, int(os.environ.get("STAGE3_WORKERS", "4")))
+    if workers == 1:
+        for track_id, preview_url in batch:
+            _process_track(track_id, preview_url, logger)
+    else:
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = [pool.submit(_process_track, tid, url, logger)
+                       for tid, url in batch]
+            for fut in futures:
+                # Per-track failures are caught and logged inside _process_track,
+                # so .result() should not raise. Surface anything unexpected.
+                fut.result()
+    return len(batch)
 
 
 def main() -> None:

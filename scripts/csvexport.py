@@ -8,6 +8,9 @@ Row gate:  track must have track_analysis.status='ok' (Essentia data present).
 
 Output:    exports/<timestamp>/charts_<country>.csv
            (one file per country found in chart_entries, unless --country narrows)
+           With --combined, a single exports/<timestamp>/charts_all.csv is
+           produced instead, containing every selected country in one file
+           (the country column distinguishes the rows).
 
 Backends: SQLite (default) or PostgreSQL. Pass --database-url
 postgresql://user:pass@host/db (or set DATABASE_URL) to read from Postgres;
@@ -148,9 +151,14 @@ HLC_CLASSIFIERS = [
 # ----------------------------------------------------------------------------
 # SQL builder
 # ----------------------------------------------------------------------------
-def build_select_sql(args: argparse.Namespace) -> tuple[str, list[str]]:
+def build_select_sql(args: argparse.Namespace, country_count: int = 1) -> tuple[str, list[str]]:
     """
     Returns (sql, header_columns).
+
+    `country_count` controls the WHERE clause: 1 → `ce.country = ?` (per-country
+    export), N>1 → `ce.country IN (?, ?, ...)` (combined export across the
+    selected countries). The caller passes the matching number of country
+    placeholders in the params tuple.
 
     Joins:
         chart_entries -> tracks -> track_reccobeats (duration_ms only)
@@ -190,7 +198,12 @@ def build_select_sql(args: argparse.Namespace) -> tuple[str, list[str]]:
 
     select_sql = ",\n           ".join(select_parts)
 
-    where: list[str] = ["ce.country = ?"]
+    if country_count <= 1:
+        country_clause = "ce.country = ?"
+    else:
+        placeholders = ", ".join(["?"] * country_count)
+        country_clause = f"ce.country IN ({placeholders})"
+    where: list[str] = [country_clause]
     if not args.no_essentia_gate:
         where.append("a.status = 'ok'")
     if args.require_reccobeats:
@@ -235,15 +248,19 @@ def build_select_sql(args: argparse.Namespace) -> tuple[str, list[str]]:
     return sql, header
 
 
-def build_latest_only_sql(args: argparse.Namespace) -> tuple[str, list[str]]:
-    """One row per (track, country): the most recent chart_entries appearance."""
-    inner_sql, header = build_select_sql(args)
+def build_latest_only_sql(args: argparse.Namespace, country_count: int = 1) -> tuple[str, list[str]]:
+    """One row per (track, country): the most recent chart_entries appearance.
+    Partitioning by (track_id, country) keeps the semantics correct in both
+    per-country exports (only one country in scope anyway) and combined
+    exports (one latest row per country)."""
+    inner_sql, header = build_select_sql(args, country_count=country_count)
     # Subquery aliases (AS base / AS ranked) are required by Postgres.
     wrapped = f"""
         SELECT * FROM (
             SELECT *,
                    ROW_NUMBER() OVER (
-                       PARTITION BY track_id ORDER BY week_date DESC, position ASC
+                       PARTITION BY track_id, country
+                       ORDER BY week_date DESC, position ASC
                    ) AS rn
             FROM ({inner_sql}) AS base
         ) AS ranked WHERE rn = 1
@@ -315,31 +332,23 @@ def open_writer(path: Path, gzip_output: bool):
     return fh, csv.writer(fh, quoting=csv.QUOTE_MINIMAL), path
 
 
-def export_country(
+def _run_query_to_csv(
     conn: DbHandle,
-    country: str,
-    out_dir: Path,
-    args: argparse.Namespace,
+    sql: str,
+    header: list[str],
+    params: tuple,
+    out_path: Path,
+    gzip_output: bool,
 ) -> tuple[Path, int]:
-    if args.latest_only:
-        sql, header = build_latest_only_sql(args)
-    else:
-        sql, header = build_select_sql(args)
-
-    params: list = [country]
-    if args.since:
-        params.append(args.since)
-    if args.min_streams is not None:
-        params.append(args.min_streams)
-
-    cur = conn.execute(sql, tuple(params))
+    """Stream a query result into a CSV at `out_path`. Used by both the
+    per-country and combined exporters so the row-writing code lives once."""
+    cur = conn.execute(sql, params)
     actual_cols = [d[0] for d in cur.description]
     # In --latest-only the wrapped query exposes 'rn'; keep only declared header cols.
     keep_idx = [i for i, c in enumerate(actual_cols) if c in header]
     keep_header = [actual_cols[i] for i in keep_idx]
 
-    out = out_dir / f"charts_{country}.csv"
-    fh, writer, final_path = open_writer(out, args.gzip)
+    fh, writer, final_path = open_writer(out_path, gzip_output)
     rows = 0
     try:
         writer.writerow(keep_header)
@@ -349,6 +358,55 @@ def export_country(
     finally:
         fh.close()
     return final_path, rows
+
+
+def export_country(
+    conn: DbHandle,
+    country: str,
+    out_dir: Path,
+    args: argparse.Namespace,
+) -> tuple[Path, int]:
+    if args.latest_only:
+        sql, header = build_latest_only_sql(args, country_count=1)
+    else:
+        sql, header = build_select_sql(args, country_count=1)
+
+    params: list = [country]
+    if args.since:
+        params.append(args.since)
+    if args.min_streams is not None:
+        params.append(args.min_streams)
+
+    return _run_query_to_csv(
+        conn, sql, header, tuple(params),
+        out_dir / f"charts_{country}.csv", args.gzip,
+    )
+
+
+def export_combined(
+    conn: DbHandle,
+    countries: list[str],
+    out_dir: Path,
+    args: argparse.Namespace,
+) -> tuple[Path, int]:
+    """Export every selected country into a single `charts_all.csv`.
+    Uses one SQL query with `ce.country IN (...)` so the result is streamed
+    out in one pass — no per-country buffering or repeated queries."""
+    if args.latest_only:
+        sql, header = build_latest_only_sql(args, country_count=len(countries))
+    else:
+        sql, header = build_select_sql(args, country_count=len(countries))
+
+    params: list = list(countries)
+    if args.since:
+        params.append(args.since)
+    if args.min_streams is not None:
+        params.append(args.min_streams)
+
+    return _run_query_to_csv(
+        conn, sql, header, tuple(params),
+        out_dir / "charts_all.csv", args.gzip,
+    )
 
 
 # ----------------------------------------------------------------------------
@@ -370,6 +428,11 @@ def parse_args() -> argparse.Namespace:
 
     p.add_argument("--country", action="append", default=[],
                    help="Restrict to country code (repeatable). Default: all countries.")
+
+    p.add_argument("--combined", action="store_true",
+                   help="Produce a single charts_all.csv across the selected "
+                        "countries instead of one file per country. The country "
+                        "column distinguishes the rows.")
 
     p.add_argument("--latest-only", action="store_true",
                    help="One row per (track, country): the most recent chart appearance.")
@@ -412,6 +475,7 @@ def main() -> None:
     if args.require_audio_features:
         gate += " + audio features (any source)"
     shape = "latest per (track,country)" if args.latest_only else "one row per chart entry"
+    layout = "single combined file" if args.combined else "one file per country"
 
     if conn.backend == "postgres":
         # Don't echo the URL — it may contain credentials.
@@ -424,14 +488,20 @@ def main() -> None:
     print(f"Countries: {', '.join(countries)}")
     print(f"Gate:      {gate}")
     print(f"Shape:     {shape}")
+    print(f"Layout:    {layout}")
     print()
 
-    total = 0
-    for country in countries:
-        path, n = export_country(conn, country, args.out, args)
-        total += n
-        print(f"  {path.name}: {n} rows")
-    print(f"\nTotal: {total} rows across {len(countries)} file(s).")
+    if args.combined:
+        path, total = export_combined(conn, countries, args.out, args)
+        print(f"  {path.name}: {total} rows ({len(countries)} countries)")
+        print(f"\nTotal: {total} rows in 1 file.")
+    else:
+        total = 0
+        for country in countries:
+            path, n = export_country(conn, country, args.out, args)
+            total += n
+            print(f"  {path.name}: {n} rows")
+        print(f"\nTotal: {total} rows across {len(countries)} file(s).")
     conn.close()
 
 

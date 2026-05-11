@@ -252,11 +252,14 @@ def build_latest_only_sql(args: argparse.Namespace, country_count: int = 1) -> t
     """One row per (track, country): the most recent chart_entries appearance.
     Partitioning by (track_id, country) keeps the semantics correct in both
     per-country exports (only one country in scope anyway) and combined
-    exports (one latest row per country)."""
+    exports (one latest row per country). The outer SELECT projects the
+    header columns explicitly so the cursor returns exactly those columns
+    in the right order — no Python-side filtering needed."""
     inner_sql, header = build_select_sql(args, country_count=country_count)
+    cols = ", ".join(header)
     # Subquery aliases (AS base / AS ranked) are required by Postgres.
     wrapped = f"""
-        SELECT * FROM (
+        SELECT {cols} FROM (
             SELECT *,
                    ROW_NUMBER() OVER (
                        PARTITION BY track_id, country
@@ -359,20 +362,18 @@ def _run_query_to_csv(
     out_path: Path,
     gzip_output: bool,
 ) -> tuple[Path, int]:
-    """Stream a query result into a CSV at `out_path`. Used by both the
-    per-country and combined exporters so the row-writing code lives once."""
+    """Stream a query result into a CSV at `out_path`. Both build_select_sql
+    and build_latest_only_sql project exactly the `header` columns in order,
+    so we can write the header straight from `header` and each row
+    positionally — no need to introspect `cur.description` (which a psycopg2
+    server-side cursor doesn't populate until after the first fetch)."""
     cur = conn.execute(sql, params)
-    actual_cols = [d[0] for d in cur.description]
-    # In --latest-only the wrapped query exposes 'rn'; keep only declared header cols.
-    keep_idx = [i for i, c in enumerate(actual_cols) if c in header]
-    keep_header = [actual_cols[i] for i in keep_idx]
-
     fh, writer, final_path = open_writer(out_path, gzip_output)
     rows = 0
     try:
-        writer.writerow(keep_header)
+        writer.writerow(header)
         for row in cur:
-            writer.writerow([row[i] for i in keep_idx])
+            writer.writerow(list(row))
             rows += 1
     finally:
         fh.close()

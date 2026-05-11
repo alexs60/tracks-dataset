@@ -7,7 +7,11 @@ Row gate:  track must have track_analysis.status='ok' (Essentia data present).
            Reccobeats data is included when available, blank when not.
 
 Output:    exports/<timestamp>/charts_<country>.csv
-           (one file per country found in chart_entries, unless --country narrows)
+           (one file per country in the discovery seed set, unless --country
+           narrows). The default country list comes from track_country_totals
+           — the same set status.py reports. Pass --all-chart-countries to
+           use every country in chart_entries instead (the wider set that
+           includes countries surfaced only via per-track Kworb pages).
            With --combined, a single exports/<timestamp>/charts_all.csv is
            produced instead, containing every selected country in one file
            (the country column distinguishes the rows).
@@ -338,7 +342,31 @@ def open_db(args: argparse.Namespace) -> DbHandle:
     return DbHandle(conn, "sqlite")
 
 
-def list_countries(conn: DbHandle) -> list[str]:
+def list_countries(conn: DbHandle, source: str) -> list[str]:
+    """Return the default country set.
+
+    `source="totals"` reads from `track_country_totals` — the discovery seed
+    set the scraper was explicitly asked to track (and what `status.py`
+    reports). This is usually what an operator means by "all my countries".
+
+    `source="chart-entries"` reads from `chart_entries.country`, which
+    additionally includes every country that surfaced through any track's
+    per-track Kworb history page, even ones never seeded. Useful only when
+    you want the wider chart-data set."""
+    if source == "totals":
+        try:
+            cur = conn.execute(
+                "SELECT DISTINCT country FROM track_country_totals ORDER BY country"
+            )
+            countries = [r[0] for r in cur.fetchall()]
+        except Exception:
+            countries = []
+        if countries:
+            return countries
+        # Fall through: no totals rows yet (fresh DB). Use chart_entries so
+        # the script still produces something rather than failing.
+        print("Note: track_country_totals is empty; falling back to "
+              "chart_entries for the country list.", file=sys.stderr)
     cur = conn.execute(
         "SELECT DISTINCT country FROM chart_entries ORDER BY country"
     )
@@ -354,6 +382,22 @@ def open_writer(path: Path, gzip_output: bool):
     return fh, csv.writer(fh, quoting=csv.QUOTE_MINIMAL), path
 
 
+_PROGRESS_EVERY = 5000  # match server-side cursor itersize so it ticks per fetch
+
+
+def _emit_progress(label: str, rows: int, *, final: bool = False) -> None:
+    """Print a rolling row counter to stderr. Uses `\\r` on a TTY so the
+    line updates in place; falls back to plain newlines when stderr is
+    redirected (e.g. piped to a file) to keep the log readable."""
+    tty = sys.stderr.isatty()
+    suffix = "\n" if final or not tty else ""
+    if tty and not final:
+        sys.stderr.write(f"\r  {label}: {rows:,} rows{suffix}")
+    else:
+        sys.stderr.write(f"  {label}: {rows:,} rows{suffix}")
+    sys.stderr.flush()
+
+
 def _run_query_to_csv(
     conn: DbHandle,
     sql: str,
@@ -361,12 +405,15 @@ def _run_query_to_csv(
     params: tuple,
     out_path: Path,
     gzip_output: bool,
+    progress_label: str | None = None,
 ) -> tuple[Path, int]:
     """Stream a query result into a CSV at `out_path`. Both build_select_sql
     and build_latest_only_sql project exactly the `header` columns in order,
     so we can write the header straight from `header` and each row
     positionally — no need to introspect `cur.description` (which a psycopg2
-    server-side cursor doesn't populate until after the first fetch)."""
+    server-side cursor doesn't populate until after the first fetch).
+
+    `progress_label` toggles a rolling stderr counter; pass None to silence."""
     cur = conn.execute(sql, params)
     fh, writer, final_path = open_writer(out_path, gzip_output)
     rows = 0
@@ -375,6 +422,10 @@ def _run_query_to_csv(
         for row in cur:
             writer.writerow(list(row))
             rows += 1
+            if progress_label and rows % _PROGRESS_EVERY == 0:
+                _emit_progress(progress_label, rows)
+        if progress_label:
+            _emit_progress(progress_label, rows, final=True)
     finally:
         fh.close()
         try:
@@ -404,6 +455,7 @@ def export_country(
     return _run_query_to_csv(
         conn, sql, header, tuple(params),
         out_dir / f"charts_{country}.csv", args.gzip,
+        progress_label=f"charts_{country}.csv",
     )
 
 
@@ -430,6 +482,7 @@ def export_combined(
     return _run_query_to_csv(
         conn, sql, header, tuple(params),
         out_dir / "charts_all.csv", args.gzip,
+        progress_label="charts_all.csv",
     )
 
 
@@ -451,7 +504,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--gzip", action="store_true", help="gzip the CSVs")
 
     p.add_argument("--country", action="append", default=[],
-                   help="Restrict to country code (repeatable). Default: all countries.")
+                   help="Restrict to country code (repeatable). Default: every "
+                        "country in track_country_totals (the discovery seed "
+                        "set — same list shown by status.py).")
+    p.add_argument("--all-chart-countries", action="store_true",
+                   help="When no --country is given, default to every country "
+                        "in chart_entries instead of the discovery seed set. "
+                        "This is the wider set (includes any country that "
+                        "surfaced via per-track Kworb pages).")
 
     p.add_argument("--combined", action="store_true",
                    help="Produce a single charts_all.csv across the selected "
@@ -489,7 +549,8 @@ def main() -> None:
 
     conn = open_db(args)
 
-    countries = args.country or list_countries(conn)
+    source = "chart-entries" if args.all_chart_countries else "totals"
+    countries = args.country or list_countries(conn, source)
     if not countries:
         sys.exit("No countries found in chart_entries (and none specified).")
 

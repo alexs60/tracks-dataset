@@ -272,20 +272,36 @@ def build_latest_only_sql(args: argparse.Namespace, country_count: int = 1) -> t
 # I/O helpers
 # ----------------------------------------------------------------------------
 class DbHandle:
-    """Minimal uniform handle over sqlite3 / psycopg2 connections."""
+    """Minimal uniform handle over sqlite3 / psycopg2 connections.
+
+    For Postgres, `execute()` returns a server-side (named) cursor so that
+    large result sets stream from the server in chunks rather than being
+    buffered in client memory. The combined export can produce millions of
+    rows; a regular client-side cursor would OOM the process."""
 
     def __init__(self, raw: Any, backend: str) -> None:
         self.raw = raw
         self.backend = backend  # "sqlite" | "postgres"
+        self._cursor_seq = 0
 
     def execute(self, sql: str, params: tuple = ()) -> Any:
         if self.backend == "postgres":
-            cur = self.raw.cursor()
+            # Unique cursor name lets the same connection open multiple
+            # named cursors (e.g. list_countries + export) without clash.
+            self._cursor_seq += 1
+            cur = self.raw.cursor(name=f"csvexport_{self._cursor_seq}")
+            cur.itersize = 5000  # rows per server fetch
             cur.execute(sql.replace("?", "%s"), params)
             return cur
         return self.raw.execute(sql, params)
 
     def close(self) -> None:
+        if self.backend == "postgres":
+            # End the read-only transaction cleanly before closing.
+            try:
+                self.raw.rollback()
+            except Exception:
+                pass
         self.raw.close()
 
 
@@ -300,8 +316,11 @@ def open_db(args: argparse.Namespace) -> DbHandle:
         except ImportError:
             sys.exit("psycopg2 is required for Postgres. pip install psycopg2-binary")
         # Read-only session prevents accidental writes from this script.
+        # autocommit=False is required: named (server-side) cursors only
+        # work inside a real transaction. The transaction is rolled back
+        # on close.
         conn = psycopg2.connect(db_url)
-        conn.set_session(readonly=True, autocommit=True)
+        conn.set_session(readonly=True, autocommit=False)
         return DbHandle(conn, "postgres")
 
     if args.db is None:
@@ -357,6 +376,10 @@ def _run_query_to_csv(
             rows += 1
     finally:
         fh.close()
+        try:
+            cur.close()
+        except Exception:
+            pass
     return final_path, rows
 
 
